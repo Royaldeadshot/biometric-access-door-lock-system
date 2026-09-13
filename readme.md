@@ -44,5 +44,52 @@ I used to go my GYM and used to see this biometric access door lock, and one it 
 ![enclosure t](/enclosure_top.png)
 ![enclosure b](/enclosure_back.png)
 
-##Code
-Code avaialble In the 
+## Code
+Code avaialble In the Code folder of this repository. Flash the code using arduino ide, and also install theese libraries Adafruit Fingerprint, FastLED, Firebase ESP32 Client.
+
+
+## Working Flow
+
+### 1. Access Attempt → Member Scans Finger
+1. Member places finger on the R307S fingerprint scanner.
+2. The R307S captures the scan and checks it against the fingerprint templates stored on the sensor itself, retrieving a matched fingerprint ID if one exists.
+3. The ESP32 takes that fingerprint ID and queries the gym management website's database to check whether a member record is linked to it.
+
+Case A — Member found, membership active
+
+LED ring blinks green
+* Buzzer beeps once
+* Relay activates, retracting the solenoid lock for 2-3 seconds (exact duration to be finalized after physical testing)
+* Door opens, lock releases automatically once the retract window ends
+
+Case B — Member found, membership expired
+
+* LED ring blinks red
+* Buzzer beeps rapidly, 3 times
+* Lock stays engaged, door does not open
+
+Case C — Fingerprint not recognized (no matching record)
+
+* LED ring turns orange
+* Buzzer stays silent
+* Lock stays engaged door does not open
+
+### 2. Exit → Push Button
+* Member presses the exit button on the inside of the door.
+* No fingerprint check is required, this triggers the relay directly, retracting the lock and opening the door.
+* This ensures free exit at all times, independent of the membership check or fingerprint recognition.
+
+### 3. New Member Enrollment
+1. Gym owner clicks "Register" on the gym management website and fills in the new member's details.
+2. The website sends an enrollment request to the ESP32.
+3. The ESP32 switches the R307S sensor into enrollment mode.
+4. During this process, the LED ring displays a circular loading animation in yellow, giving visual feedback that enrollment is in progress.
+5. The new member places their finger on the scanner, the sensor captures and stores the fingerprint template internally, generating a new fingerprint ID.
+6. Once the scan completes successfully, the LED animation turn purple for 5 seconds and then goes to idle, (signaling completion).
+7. The ESP32 sends the newly generated fingerprint ID back to the website, which stores it against that member's record in the database completing the link between "fingerprint" and "member."
+
+## Website
+* The website is hosted and accesible on this url- https://fitnessbox.vercel.app
+* Here is the website's Repo link- https://github.com/Royaldeadshot/gym-management
+* Just Copy the repo and host it and connect firebase and add email/password auth to acces the site.
+* Currently the website is not integrated yet, once i get the parts all joined up then I will connect the two, the website and the biometric door lock system.
