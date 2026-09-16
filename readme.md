@@ -14,7 +14,7 @@ I used to go my GYM and used to see this biometric access door lock, and one it 
 
 ## Parts List
 
-| Name | Qty | Link | Price |
+| Name | Qty | Link | Price $ |
 | --- | --- | --- | --- |
 | ESP32                            | 1 | https://robocraze.com/products/esp32-development-board?_pos=1&_psq=esp&_psid=ffe363e30&_ss=e                                                                     | 4.17 |
 | R307S Fingerprint Scanner Module | 1 | https://robu.in/product/r307-optical-fingerprint-reader-module-sensor/                                                                                           | 9.52 |
