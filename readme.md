@@ -16,21 +16,21 @@ I used to go my GYM and used to see this biometric access door lock, and one it 
 
 | Name | Qty | Link |
 | --- | --- | --- |
-| ESP32                            | 1 | https://robocraze.com/products/esp32-development-board?_pos=1&_psq=esp&_psid=ffe363e30&_ss=e |
-| R307S Fingerprint Scanner Module | 1 | https://robu.in/product/r307-optical-fingerprint-reader-module-sensor/ |
-| Solenoid Door Lock               | 1 | https://robocraze.com/products/12v-dc-lock-electric-solenoid-assembly?_pos=1&_sid=4b8eba6e6&_ss=r |
-| 12V Power supply                 | 1 | https://robocraze.com/products/12-volt-2-amp-power-adapter-ac-to-dc?_pos=1&_psq=12v&_psid=6336dae56&_ss=e |
-| 12V Relay                        | 1 | https://robocraze.com/products/12v-2-channel-relay-module-with-optocoupler-isolation?_pos=6&_sid=333247d21&_ss=r |
-| 12V to 5V Buck converter         | 1 | https://robocraze.com/products/lm2596-dc-dc-buck-module?_pos=1&_psq=LM2596+DC-DC+Buck+Converter+Adjustable+Step+Down+Power+Supply+Module&_psid=99fdbbb4d&_ss=e | 
-| Buzzer                           | 1 | https://robocraze.com/products/3-volts-buzzer-small?_pos=1&_sid=47bbfcefe&_ss=r |
-| Diode                            | 1 | https://robocraze.com/products/1n4007-diode-pack-of-10?_pos=1&_sid=7c56ba663&_ss=r |
-| Switch                           | 1 | any kind of push switch works |
-| LED (sk6812 mini e)              | 8 | I just have them, i don't have a link of those |
-| 3d Printed Enclosure             | 1 | - |
-| Diffuser sheet                   | 1 | find something which can diffuse light well enough |
-| Jumper wires                     | - | https://robocraze.com/products/jumper-wire-set-m2m-m2f-f2f-40-pcs-each |
-| M3 Heatset inserts               | 4 | - |
-| M3 Screws                        | 4 | - |
+| ESP32                            | 1 | https://robocraze.com/products/esp32-development-board?_pos=1&_psq=esp&_psid=ffe363e30&_ss=e                                                                     | 4.17 |
+| R307S Fingerprint Scanner Module | 1 | https://robu.in/product/r307-optical-fingerprint-reader-module-sensor/                                                                                           | 9.52 |
+| Solenoid Door Lock               | 1 | https://robocraze.com/products/12v-dc-lock-electric-solenoid-assembly?_pos=1&_sid=4b8eba6e6&_ss=r                                                                | 3.85 |
+| 12V Power supply                 | 1 | https://robocraze.com/products/12-volt-2-amp-power-adapter-ac-to-dc?_pos=1&_psq=12v&_psid=6336dae56&_ss=e                                                        | 1.88 |
+| 12V Relay                        | 1 | https://robocraze.com/products/12v-2-channel-relay-module-with-optocoupler-isolation?_pos=6&_sid=333247d21&_ss=r                                                 | 0.93 |
+| 12V to 5V Buck converter         | 1 | https://robocraze.com/products/lm2596-dc-dc-buck-module?_pos=1&_psq=LM2596+DC-DC+Buck+Converter+Adjustable+Step+Down+Power+Supply+Module&_psid=99fdbbb4d&_ss=e   | 0.5 |
+| Buzzer                           | 1 | https://robocraze.com/products/3-volts-buzzer-small?_pos=1&_sid=47bbfcefe&_ss=r                                                                                  | 0.15 |
+| Diode                            | 1 | https://robocraze.com/products/1n4007-diode-pack-of-10?_pos=1&_sid=7c56ba663&_ss=r                                                                               | 0.16 |
+| Switch                           | 1 | any kind of push switch works                                                                                                                                    | 0 |
+| LED (sk6812 mini e)              | 8 | I just have them, i don't have a link of those                                                                                                                   | 0 |
+| 3d Printed Enclosure             | 1 | -                                                                                                                                                                | 5 |
+| Diffuser sheet                   | 1 | find something which can diffuse light well enough                                                                                                               | 0 |
+| Jumper wires                     | - | https://robocraze.com/products/jumper-wire-set-m2m-m2f-f2f-40-pcs-each                                                                                           | 1.45 |
+| M3 Heatset inserts               | 4 | -                                                                                                                                                                | 0 |
+| M3 Screws                        | 4 | -                                                                                                                                                                | 0 |
 
 ## Images
 ### Wiring
