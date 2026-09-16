@@ -44,6 +44,11 @@ I used to go my GYM and used to see this biometric access door lock, and one it 
 ![enclosure t](/enclosure_top.png)
 ![enclosure b](/enclosure_back.png)
 
+## FInished Build Image
+![build top](/build_top.png)
+![build front](/build_front.png)
+![build back](/build_back.png)
+
 ## Code
 Code avaialble In the Code folder of this repository. Flash the code using arduino ide, and also install theese libraries Adafruit Fingerprint, FastLED, Firebase ESP32 Client.
 
