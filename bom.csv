@@ -1,6 +1,6 @@
 S. No.,Part Name,Price,Quantity,Total Amount,Link
 1,ESP32,4.17,1,4.17,https://robocraze.com/products/esp32-development-board?_pos=1&_psq=esp&_psid=ffe363e30&_ss=e
-2,Fingerprint Scanner Module,99.52,1,9.52,https://robu.in/product/r307-optical-fingerprint-reader-module-sensor/
+2,Fingerprint Scanner Module,9.52,1,9.52,https://robu.in/product/r307-optical-fingerprint-reader-module-sensor/
 3,jumper wire set,1.45,1,1.45,https://robocraze.com/products/jumper-wire-set-m2m-m2f-f2f-40-pcs-each
 4,Solenoid Door Lock,3.85,1,3.85,https://robocraze.com/products/12v-dc-lock-electric-solenoid-assembly?_pos=1&_sid=4b8eba6e6&_ss=r
 5,12V Power supply,1.88,1,1.88,https://robocraze.com/products/12-volt-2-amp-power-adapter-ac-to-dc?_pos=1&_psq=12v&_psid=6336dae56&_ss=e
@@ -10,4 +10,7 @@ S. No.,Part Name,Price,Quantity,Total Amount,Link
 9,Diode,0.16,1,0.16,https://robocraze.com/products/1n4007-diode-pack-of-10?_pos=1&_sid=7c56ba663&_ss=r
 10,Switch,0,1,0,Sourced by me
 11,LED,0,8,0,sourced by me
-,,,Total,22.61,
+12,3D printed case,5,1,5,sourced by Printing legion
+13,M3 Screws and heatset,0,4,0,sourced by me
+14,Diffuser sheet,0,1,0,sourced by me
+,,,Total,27.61,
