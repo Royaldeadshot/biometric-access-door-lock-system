@@ -14,8 +14,8 @@ I used to go my GYM and used to see this biometric access door lock, and one it 
 
 ## Parts List
 
-| Name | Qty | Link |
-| --- | --- | --- |
+| Name | Qty | Link | Price |
+| --- | --- | --- | --- |
 | ESP32                            | 1 | https://robocraze.com/products/esp32-development-board?_pos=1&_psq=esp&_psid=ffe363e30&_ss=e                                                                     | 4.17 |
 | R307S Fingerprint Scanner Module | 1 | https://robu.in/product/r307-optical-fingerprint-reader-module-sensor/                                                                                           | 9.52 |
 | Solenoid Door Lock               | 1 | https://robocraze.com/products/12v-dc-lock-electric-solenoid-assembly?_pos=1&_sid=4b8eba6e6&_ss=r                                                                | 3.85 |
@@ -26,12 +26,12 @@ I used to go my GYM and used to see this biometric access door lock, and one it 
 | Diode                            | 1 | https://robocraze.com/products/1n4007-diode-pack-of-10?_pos=1&_sid=7c56ba663&_ss=r                                                                               | 0.16 |
 | Switch                           | 1 | any kind of push switch works                                                                                                                                    | 0 |
 | LED (sk6812 mini e)              | 8 | I just have them, i don't have a link of those                                                                                                                   | 0 |
-| 3d Printed Enclosure             | 1 | -                                                                                                                                                                | 5 |
+| 3d Printed Enclosure             | 1 | Source by Hackclub Printing  Legion                                                                                                                              | 5 |
 | Diffuser sheet                   | 1 | find something which can diffuse light well enough                                                                                                               | 0 |
 | Jumper wires                     | - | https://robocraze.com/products/jumper-wire-set-m2m-m2f-f2f-40-pcs-each                                                                                           | 1.45 |
 | M3 Heatset inserts               | 4 | -                                                                                                                                                                | 0 |
 | M3 Screws                        | 4 | -                                                                                                                                                                | 0 |
-
+|                                  |   | TOTAL                                                                                                                                                            | 27.61 |
 ## Images
 ### Wiring
 ![wiring image](/wiring.png)
