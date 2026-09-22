@@ -1,7 +1,7 @@
 # ESP32 Based Biometric Access Door Lock (Tailored for GYM)
 
 ## Motivation
-I used to go my GYM and used to see this biometric access door lock, and one it struck, I can make one too, with some extra features. So here i'm building this.
+I used to go my GYM and used to see this biometric access door lock, and one day it struck me, I can make one too, with some extra features. So here i'm building this.
 
 ## Features
 1. **Fingerprint** Based Recognition.
