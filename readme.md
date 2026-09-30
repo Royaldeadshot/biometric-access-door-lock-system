@@ -34,20 +34,20 @@ I used to go my GYM and used to see this biometric access door lock, and one day
 |                                  |   | TOTAL                                                                                                                                                            | 27.61 |
 ## Images
 ### Wiring
-![wiring image](/wiring.png)
+![wiring image](images/wiring.png)
 
 ### 3D Model
-![Frontplate](/frontplate.png)
-![frontplate t](/frontplate_side.png)
-![frontplate b](/frontplate_back.png)
-![enclosure](/enclosure.png)
-![enclosure t](/enclosure_top.png)
-![enclosure b](/enclosure_back.png)
+![Frontplate](images/frontplate.png)
+![frontplate t](images/frontplate_side.png)
+![frontplate b](images/frontplate_back.png)
+![enclosure](images/enclosure.png)
+![enclosure t](images/enclosure_top.png)
+![enclosure b](images/enclosure_back.png)
 
 ## FInished Build Image
-![build top](/build_top.png)
-![build front](/build_front.png)
-![build back](/build_back.png)
+![build top](images/build_top.png)
+![build front](images/build_front.png)
+![build back](images/build_back.png)
 
 ## Code
 Code avaialble In the Code folder of this repository. Flash the code using arduino ide, and also install theese libraries Adafruit Fingerprint, FastLED, Firebase ESP32 Client.
