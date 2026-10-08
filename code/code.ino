@@ -1,210 +1,62 @@
-```cpp
-
 #include <Adafruit_Fingerprint.h>
-#include <FastLED.h>
-#include <WiFi.h>
-#include <Firebase_ESP_Client.h>
-#include "addons/TokenHelper.h"
-#include "addons/RTDBHelper.h"
 
-// Pins
-#define FINGER_RX   27
-#define FINGER_TX   28   
-#define LED_PIN     4 
-#define TOTAL_LEDS  8
-#define BTN_EXIT    26 
-#define BUZZ        19   
-#define RELAY       10 
+#define RX_PIN 16
+#define TX_PIN 17
+#define TOUCH_PIN 4
 
-// WIFI SETUP
-#define WIFI_SSID        "Wifi SSID"
-#define WIFI_PASSWORD    "password"
-#define FIREBASE_HOST    "firbase url"
-#define FIREBASE_AUTH    "auth key"
-
-// globals
-HardwareSerial mySerial(2);  // UART2 for fingerprint
-Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
-CRGB leds[TOTAL_LEDS];
-
-FirebaseData fb_data;
-FirebaseAuth auth;
-FirebaseConfig config;
-
-// timings
-unsigned long openTime = 3000;  
-unsigned long cooldown = 1500;  
-unsigned long lastAttempt = 0;
-
-// colors, messing with these later to make them look nicer
-CRGB c_idle    = CRGB(0, 0, 30);      // a bit dimmer so it doesn't blind people at night.
-CRGB c_scan    = CRGB(0, 0, 200);    
-CRGB c_ok      = CRGB(0, 200, 0);     
-CRGB c_bad     = CRGB(200, 0, 0);     
-CRGB c_expired = CRGB(200, 100, 0);  
-
-// forward declarations because C++ is annoying sometimes
-void doUnlock();
-int checkFinger();
-void processFinger(int id);
-void setRing(CRGB c);
-void beep(int times, int duration);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&Serial2);
 
 void setup() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("\nBooting up Door Lock System.....");
+  Serial.begin(9600);
+  delay(1000);
+  
+  pinMode(TOUCH_PIN, INPUT_PULLUP);
 
-  // LED Setup
-  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, TOTAL_LEDS);
-  setRing(c_idle);
+  Serial.println("\n\n--- Fitness Box Touch-Wake Test ---");
 
-  // IO Setup
-  pinMode(BUZZ, OUTPUT);
-  digitalWrite(BUZZ, LOW);
-  pinMode(BTN_EXIT, INPUT_PULLUP);
-
-  pinMode(RELAY, OUTPUT);
-  digitalWrite(RELAY, LOW); //stay locked
-
-  // init fingerprint scanner
-  mySerial.begin(57600, SERIAL_8N1, FINGER_RX, FINGER_TX);
+  Serial2.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
   finger.begin(57600);
-
-  if (Finger.verifyPassword()) {
-    Serial.println("Found fingerprint sensor");
+  delay(50);
+  
+  if (finger.verifyPassword()) {
+    Serial.println("SUCCESS: Found fingerprint sensor!");
   } else {
-    Serial.println("ERROR: Fingerprint sensor not found, Check wiring");
-    // hang here flashing red or something? nah just beep and loop
-    while (1) {
-      digitalWrite(BUZZ, HIGH);
-      delay(200);
-      digitalWrite(BUZZ, LOW);
-      delay(800);
-    }
+    Serial.println("ERROR: Did not find fingerprint sensor :(");
+    while (1) { delay(1); }
   }
 
-  // Connect Wifi
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
-
-  // Firebase init
-  config.host = FIREBASE_HOST;
-  config.signer.tokens.legacy_token = FIREBASE_AUTH;
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-
-  Serial.println("Setup finished. ready for scans.");
-
-  // quick startup beep sequence
-  beep(2, 100);
+  Serial.println("\nSensor is resting (DARK).");
+  Serial.println("Touch the metal ring/glass to wake it up!");
 }
 
 void loop() {
-  // Check exit button first - safety first!
-  if (digitalRead(BTN_EXIT) == LOW) {
-    Serial.println("Exit button pressed! Opening door...");
-    setRing(c_ok);
-    doUnlock();
-    delay(300); // debounce 
-    return;
-  }
-
-  // Fingerprint check with basic cooldown
-  if (millis() - lastAttempt > cooldown) {
-    int fingerID = checkFinger();
-    if (fingerID >= 0) {
-      lastAttempt = millis();
-      processFinger(fingerID);
-    }
-  }
-
-  setRing(C_idle);
-}
-
-int checkFinger() {
-   setRing(c_scan);
-
-   // grab image
-   if (finger.getImage() != FINGERPRINT_OK) return -1;
-
-   // convert to template
-   if (finger.Image2Tz() != FINGERPRINT_OK) return -1;
-
-   // search database in sensor
-   if (finger.fingerSearch() != FINGERPRINT_OK) {
-     Serial.println("Finger not found in local db");
-     setRing(c_bad);
-     beep(3,80);
-     delay(300);
-     return -1;
-   }
-
-   // Found a match! ID is in finger.fingerID
-   Serial.print("Found ID #"); Serial.println(finger.fingerID);
-   return finger.fingerID;  
-}
-
-void processFinger(int id) {
-  String firebasePath = "/members_by_finger_id/" + String(id);
+  int touchState = digitalRead(TOUCH_PIN);
   
-  // Let's query firebase
-  if (Firebase.RTDB.getJSON(&fb_data, firebasePath)) {
-    FirebaseJson &json = fb_data.jsonObject();
-    FirebaseJsonData jsonData;
-
-    json.get(jsonData, "status"); 
-    String membershipStatus = jsonData.stringValue;
-
-    if (membershipStatus == "active") {
-      Serial.println("Access GRANTED! Welcome.");
-      setRing(c_ok);
-      beep(1, 150);
-      doUnlock();
-    } 
-    else if (membershipStatus == "expired") {
-      Serial.println("Access DENIED: Membership expired.");
-      setRing(c_expired);
-      beep(2, 200);
-    } 
-    else {
-      Serial.println("Access DENIED: Unknown status or empty.");
-      setRing(c_bad);
-      beep(3, 100);
+  if (touchState == LOW) {
+    // 1. Wait a tiny fraction of a second for the finger to physically land flat on the glass
+    delay(250); 
+    
+    // 2. We will try up to 4 times rapidly to get a clear picture
+    uint8_t p = FINGERPRINT_NOFINGER;
+    for(int tries = 0; tries < 4; tries++) {
+      p = finger.getImage();
+      if (p == FINGERPRINT_OK) {
+        break; // Got a perfect image! Break out of the retry loop.
+      }
+      delay(100); // Wait 1/10th of a second and try the camera again
     }
-  } else {
-    Serial.println("Firebase failed: " + fb_data.errorReason());
-    // Fallback? Maybe allow cached if offline later... for now just deny
-    setRing(c_bad);
-    beep(3, 100);
+    
+    // 3. Check the final result
+    if (p == FINGERPRINT_OK) {
+      Serial.println("?? Image taken successfully!");
+      delay(1500); // Wait 1.5 seconds so we don't accidentally double-scan the same person
+    } else {
+      Serial.println("?? Touched, but couldn't get a clear image. Adjust your finger.");
+      delay(500); // Only wait half a second before letting them try again
+    }
+    
+    Serial.println("\nGoing back to sleep (DARK)...");
   }
+  
+  delay(50); 
 }
-
-void doUnlock() {
-  digitalWrite(RELAY, HIGH); // trigger relay
-  delay(openTime);
-  digitalWrite(RELAY, LOW);  // lock again
-}
-
-// helper for buzzer so I don't repeat code everywhere
-void beep(int times, int duration) {
-  for(int i=0; i<times; i++) {
-    digitalWrite(BUZZ, HIGH);
-    delay(duration);
-    digitalWrite(BUZZ, LOW);
-    if(i < times - 1) delay(100); // gap between beeps
-  }
-}
-
-void setRing(CRGB color) {
-  for(int i=0; i<TOTAL_LEDS; i++) {
-    leds[i] = color;
-  }
-  FastLED.show();
-}
-```
