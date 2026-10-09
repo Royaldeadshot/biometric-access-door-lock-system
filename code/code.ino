@@ -54,70 +54,99 @@ unsigned long lastEnrollCheck = 0;
 const unsigned long ENROLL_CHECK_INTERVAL = 3000;
 
 // ==========================================
-// 2. ACTIVE BUZZER DRIVER (MAXIMUM HARDWARE VOLUME)
-// Active buzzers have their own internal oscillator and need pure DC voltage (HIGH)
-// at maximum current drive to scream at full volume (~85dB+).
+// 2. AESTHETIC ACTIVE BUZZER AUDIO SUITE
+// Micro-burst cadence & rhythmic dynamics for active buzzers.
+// Snappy transients (20ms-45ms) sound like premium modern UI haptics,
+// while syncopated patterns make each event distinct, charming & noticeable.
 // ==========================================
 
 void activeBeep(int durationMs, int pauseMs = 35) {
-  digitalWrite(BUZZER_PIN, HIGH); // Full DC rail power
+  digitalWrite(BUZZER_PIN, HIGH);
   delay(durationMs);
   digitalWrite(BUZZER_PIN, LOW);
   if (pauseMs > 0) delay(pauseMs);
 }
 
-// Exact Betaflight Drone Active Buzzer Sequence
-// Part 1: 3 Rising cadence chirps immediately on power-up (ESC boot)
-void playDronePowerUpTones() {
-  Serial.println("🔊 [ESC BOOT] 3 High-Volume active chirps...");
-  activeBeep(65, 45);
-  activeBeep(65, 45);
-  activeBeep(150, 0);
-}
-
-// Part 2: 2 Confirmation chirps when Wi-Fi & Cloud connect (FC handshake / Armed)
-void playDroneArmedTones() {
-  Serial.println("🔊 [FC ARMED] 2 High-Volume confirmation chirps...");
-  delay(120);
-  activeBeep(85, 50);
-  activeBeep(320, 0);
-}
-
-// Full chime helper
-void playDroneStartupSound() {
-  playDronePowerUpTones();
-  delay(160);
-  playDroneArmedTones();
-}
-
-// 1. Access Granted: Loud solid beep (~180ms)
+// 1. Access Granted: Upbeat Ascending Triple-Pip Chime (VIP Welcome!)
 void soundAccessGranted() {
-  activeBeep(180, 0);
+  activeBeep(28, 25);  // Crisp initial pip
+  activeBeep(42, 30);  // Rising step
+  activeBeep(140, 0);  // Warm, solid confirmation bloom
 }
 
-// 2. Access Denied (Expired): 3 rapid loud warning beeps
+// 2. Access Denied (Unknown Finger / Retry): Polite Soft Double-Tick
+void soundAccessDeniedUnknown() {
+  activeBeep(22, 55);  // Gentle tap
+  activeBeep(22, 0);   // Gentle tap (subtle "try again" haptic)
+}
+
+// 3. Access Denied (Expired Membership): Authoritative Syncopated Warning
 void soundAccessDeniedExpired() {
-  for (int i = 0; i < 3; i++) {
-    activeBeep(90, 80);
+  activeBeep(70, 50);  // Alert 1
+  activeBeep(70, 110); // Hesitating pause
+  activeBeep(200, 0);  // Deep authoritative warning pulse
+}
+
+// 4. Interior Push-to-Exit: Snappy Tactile Unlock Pop
+void soundExitButton() {
+  activeBeep(32, 0);   // Instant micro-click confirmation
+}
+
+// 5. System Power-On / Boot: Futuristic 4-Stage Acceleration Sequence
+void soundSystemBoot() {
+  Serial.println("🔊 [SYSTEM BOOT] Power-on sequence...");
+  activeBeep(25, 30);
+  activeBeep(35, 30);
+  activeBeep(50, 40);
+  activeBeep(160, 0);
+}
+
+// 6. Wi-Fi Connected & Armed: Triumphant Cloud Handshake
+void soundCloudOnline() {
+  Serial.println("🔊 [CLOUD ONLINE] Connected & armed!");
+  delay(80);
+  activeBeep(38, 45);
+  activeBeep(200, 0);
+}
+
+// 7. Enrollment Mode Invitation: 3-Pip Rising Prompt ("Ready for Finger")
+void soundEnrollPrompt() {
+  activeBeep(40, 40);
+  activeBeep(40, 40);
+  activeBeep(85, 0);
+}
+
+// 8. Enrollment Step 1 Captured: Crisp Camera-Shutter Blip ("Remove Finger")
+void soundEnrollStep1() {
+  activeBeep(55, 0);
+}
+
+// 9. Enrollment Success: 5-Beat Celebration Fanfare (da-da-da... da-DAAA!)
+void soundEnrollSuccess() {
+  activeBeep(30, 25);
+  activeBeep(30, 25);
+  activeBeep(30, 55);
+  activeBeep(65, 35);
+  activeBeep(260, 0);
+}
+
+// 10. Enrollment Failed / Timed Out: Rapid 4-Stutter Drop
+void soundEnrollFailed() {
+  for (int i = 0; i < 4; i++) {
+    activeBeep(45, 35);
   }
 }
 
-// 3. Access Denied (Not Recognized): Silent
-void soundAccessDeniedUnknown() {
-  // Silent
-}
-
-// Enrollment Success Sound: 2 sharp confirmation chirps
-void soundEnrollSuccess() {
-  activeBeep(80, 50);
-  activeBeep(250, 0);
-}
-
-// Setup Mode Notification: 2 quick alert beeps
+// 11. Wi-Fi Setup / Captive Portal Active: Setup Beacon Chime
 void soundConfigMode() {
-  activeBeep(110, 80);
-  activeBeep(110, 0);
+  activeBeep(45, 45);
+  activeBeep(45, 120);
+  activeBeep(90, 0);
 }
+
+// Aliases for compatibility
+inline void playDronePowerUpTones() { soundSystemBoot(); }
+inline void playDroneArmedTones()   { soundCloudOnline(); }
 
 // Door Lock Solenoid Control
 void triggerSolenoid(int durationSeconds) {
@@ -349,6 +378,7 @@ void updateEnrollmentStatus(String status, uint8_t fingerId) {
 // ==========================================
 void runEnrollmentProcess() {
   triggerLedEnrollScanning();
+  soundEnrollPrompt();
   Serial.println("👉 [ENROLL] Place finger on scanner (Touch 1)...");
   
   uint8_t nextSlot = 1;
@@ -366,12 +396,13 @@ void runEnrollmentProcess() {
     delay(50);
   }
   if (p != FINGERPRINT_OK || finger.image2Tz(1) != FINGERPRINT_OK) {
+    soundEnrollFailed();
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
   
   Serial.println("👍 Image 1 captured! Remove finger...");
-  activeBeep(80, 0);
+  soundEnrollStep1();
   delay(1000);
   p = 0;
   while (p != FINGERPRINT_NOFINGER) {
@@ -388,12 +419,14 @@ void runEnrollmentProcess() {
     delay(50);
   }
   if (p != FINGERPRINT_OK || finger.image2Tz(2) != FINGERPRINT_OK) {
+    soundEnrollFailed();
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
 
   if (finger.createModel() != FINGERPRINT_OK) {
     Serial.println("❌ Fingerprints did not match.");
+    soundEnrollFailed();
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
@@ -404,6 +437,7 @@ void runEnrollmentProcess() {
     triggerLedEnrollSuccess();
     updateEnrollmentStatus("SUCCESS", nextSlot);
   } else {
+    soundEnrollFailed();
     updateEnrollmentStatus("ERROR", 0);
   }
 }
@@ -424,6 +458,7 @@ void handleFingerprintVerification() {
 
   if (p != FINGERPRINT_OK || finger.image2Tz() != FINGERPRINT_OK) {
     Serial.println("⚠️ Could not read fingerprint.");
+    soundAccessDeniedUnknown(); // Soft double-tick to prompt re-tap
     delay(500);
     return;
   }
@@ -644,8 +679,8 @@ void setup() {
   // Prevent ESP-IDF from auto-connecting with stale internal NVS settings
   WiFi.persistent(false);
 
-  // 1. Instantly play the 3 rising ESC initialization tones on power-on!
-  playDronePowerUpTones();
+  // 1. Play futuristic power-on boot sequence
+  soundSystemBoot();
 
   // Initialize Fingerprint Sensor
   Serial2.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
@@ -690,8 +725,8 @@ void setup() {
     Serial.println("\n✅ Wi-Fi Connected! IP: " + WiFi.localIP().toString());
     Serial.println("🏢 Linked Gym ID: " + linkedGymId);
     
-    // 2. Play the 2 final confirmation tones now that we're connected & armed!
-    playDroneArmedTones();
+    // 2. Play cloud armed & online chime!
+    soundCloudOnline();
   } else {
     Serial.println("\n⚠️ Failed to connect to saved Wi-Fi. Launching Setup Portal fallback...");
     WiFi.setAutoReconnect(false);
@@ -713,6 +748,7 @@ void loop() {
     delay(50); // Software debounce
     if (digitalRead(EXIT_BUTTON_PIN) == LOW) {
       Serial.println("🚪 [EXIT] Interior Exit Button Pressed!");
+      soundExitButton();
       triggerSolenoid(3);
       logAccessEvent("EXIT", "INTERIOR_BUTTON", "Free exit");
       // Wait until button is released
