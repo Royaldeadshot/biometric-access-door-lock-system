@@ -6,6 +6,7 @@
 #include <Preferences.h>
 #include <Adafruit_Fingerprint.h>
 #include "secrets.h"
+#include <driver/gpio.h>
 
 // ==========================================
 // 1. PIN DEFINITIONS
@@ -16,13 +17,21 @@
 #define TOUCH_PIN 4       // ESP32 GPIO4 <- R307S Touch Out (Blue Wire)
                           // (White Wire connects to ESP32 3.3V)
 
-// Audio & Hardware Feedback
-#define BUZZER_PIN 19     // Active Buzzer Positive (+) -> GPIO 19 (Pin 31). Negative (-) -> GND
+// Audio Feedback (Active Buzzer)
+#define BUZZER_PIN 19            // Active Buzzer Positive (+) -> GPIO 19. Negative (-) -> GND
 
-// Future Hardware Placeholders
-#define RELAY_PIN 25      // Solenoid Door Lock Relay Signal (Future)
-#define LED_PIN 18        // WS2812 / SK6812 LED Ring Data (Future)
-#define EXIT_BUTTON_PIN 27// Interior Push-to-Exit Button (Future, active low)
+// Door Lock Relay (Solenoid)
+#define RELAY_PIN 25             // ESP32 GPIO 25 (Pin D25) -> Relay IN pin
+// Most relay modules are ACTIVE LOW or ACTIVE HIGH.
+// Set to HIGH if your relay triggers ON with HIGH, or LOW if your relay triggers ON with LOW.
+#define RELAY_ACTIVE_LEVEL HIGH
+#define RELAY_INACTIVE_LEVEL (!RELAY_ACTIVE_LEVEL)
+
+// Interior Push-to-Exit Button
+#define EXIT_BUTTON_PIN 27       // ESP32 GPIO 27 (Pin D27) -> Switch Pin 1. Switch Pin 2 -> GND
+
+// LED Ring (Future)
+#define LED_PIN 18               // WS2812 / SK6812 LED Ring Data (GPIO 18)
 
 // Captive Portal AP Name
 const char* AP_SSID = "FitnessBox-Scanner";
@@ -45,35 +54,33 @@ unsigned long lastEnrollCheck = 0;
 const unsigned long ENROLL_CHECK_INTERVAL = 3000;
 
 // ==========================================
-// 2. ACTIVE BUZZER DRIVER (MAXIMUM LOUDNESS)
-// Active buzzers need full DC voltage (HIGH) to trigger their internal oscillator!
-// ==========================================
-// 2. AUDIO FEEDBACK & AUTHENTIC DRONE STARTUP TUNE
-// (Matching the Betaflight / BLHeli ESC DShot startup sound)
+// 2. ACTIVE BUZZER DRIVER (MAXIMUM HARDWARE VOLUME)
+// Active buzzers have their own internal oscillator and need pure DC voltage (HIGH)
+// at maximum current drive to scream at full volume (~85dB+).
 // ==========================================
 
-void playToneNote(int freq, int durationMs, int pauseMs = 35) {
-  tone(BUZZER_PIN, freq);
+void activeBeep(int durationMs, int pauseMs = 35) {
+  digitalWrite(BUZZER_PIN, HIGH); // Full DC rail power
   delay(durationMs);
-  noTone(BUZZER_PIN);
+  digitalWrite(BUZZER_PIN, LOW);
   if (pauseMs > 0) delay(pauseMs);
 }
 
-// Exact Betaflight / BLHeli ESC Startup Chimes
-// Part 1: 3 Rising tones immediately on hardware power-up (ESC boot)
+// Exact Betaflight Drone Active Buzzer Sequence
+// Part 1: 3 Rising cadence chirps immediately on power-up (ESC boot)
 void playDronePowerUpTones() {
-  Serial.println("🔊 [ESC BOOT] Playing 3 rising power-up tones...");
-  playToneNote(1175, 90, 35); // D6
-  playToneNote(1397, 90, 35); // F6
-  playToneNote(1760, 130, 0); // A6
+  Serial.println("🔊 [ESC BOOT] 3 High-Volume active chirps...");
+  activeBeep(65, 45);
+  activeBeep(65, 45);
+  activeBeep(150, 0);
 }
 
-// Part 2: 2 Confirmation tones when Wi-Fi & Cloud connect (FC handshake / Armed)
+// Part 2: 2 Confirmation chirps when Wi-Fi & Cloud connect (FC handshake / Armed)
 void playDroneArmedTones() {
-  Serial.println("🔊 [FC ARMED] Playing 2 final connection confirmation tones...");
+  Serial.println("🔊 [FC ARMED] 2 High-Volume confirmation chirps...");
   delay(120);
-  playToneNote(1175, 95, 35); // D6
-  playToneNote(2349, 320, 0); // D7 (Long high confirmation)
+  activeBeep(85, 50);
+  activeBeep(320, 0);
 }
 
 // Full chime helper
@@ -83,15 +90,15 @@ void playDroneStartupSound() {
   playDroneArmedTones();
 }
 
-// 1. Access Granted: Crisp high-volume resonant beep (~2700 Hz)
+// 1. Access Granted: Loud solid beep (~180ms)
 void soundAccessGranted() {
-  playToneNote(2700, 180, 0);
+  activeBeep(180, 0);
 }
 
-// 2. Access Denied (Expired): 3 rapid warning beeps (~2200 Hz)
+// 2. Access Denied (Expired): 3 rapid loud warning beeps
 void soundAccessDeniedExpired() {
   for (int i = 0; i < 3; i++) {
-    playToneNote(2200, 90, 90);
+    activeBeep(90, 80);
   }
 }
 
@@ -100,25 +107,25 @@ void soundAccessDeniedUnknown() {
   // Silent
 }
 
-// Enrollment Success Sound: 2 rising confirmation chirps
+// Enrollment Success Sound: 2 sharp confirmation chirps
 void soundEnrollSuccess() {
-  playToneNote(1760, 90, 40);
-  playToneNote(2700, 240, 0);
+  activeBeep(80, 50);
+  activeBeep(250, 0);
 }
 
 // Setup Mode Notification: 2 quick alert beeps
 void soundConfigMode() {
-  playToneNote(2400, 110, 80);
-  playToneNote(2400, 110, 0);
+  activeBeep(110, 80);
+  activeBeep(110, 0);
 }
 
-// Hardware Placeholders
+// Door Lock Solenoid Control
 void triggerSolenoid(int durationSeconds) {
-  Serial.printf("⚡ [DOOR LOCK] Solenoid active for %d seconds\n", durationSeconds);
-  digitalWrite(RELAY_PIN, HIGH);
+  Serial.printf("⚡ [DOOR LOCK] Unlocking door for %d seconds...\n", durationSeconds);
+  digitalWrite(RELAY_PIN, RELAY_ACTIVE_LEVEL);
   delay(durationSeconds * 1000);
-  digitalWrite(RELAY_PIN, LOW);
-  Serial.println("🔒 [DOOR LOCK] Locked.");
+  digitalWrite(RELAY_PIN, RELAY_INACTIVE_LEVEL);
+  Serial.println("🔒 [DOOR LOCK] Relocked.");
 }
 
 void triggerLedAccessGranted()      { Serial.println("💡 [LED RING] Green pulse"); }
@@ -364,7 +371,7 @@ void runEnrollmentProcess() {
   }
   
   Serial.println("👍 Image 1 captured! Remove finger...");
-  playToneNote(2000, 80, 0);
+  activeBeep(80, 0);
   delay(1000);
   p = 0;
   while (p != FINGERPRINT_NOFINGER) {
@@ -518,7 +525,9 @@ void handleSaveConfig() {
   Serial.println("Key: " + newKey);
 
   // Connect to Wi-Fi
-  WiFi.disconnect();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect(false, false);
+  delay(50);
   WiFi.begin(newSSID.c_str(), newPass.c_str());
   
   int attempts = 0;
@@ -557,24 +566,12 @@ void handleSaveConfig() {
     String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
     html += "<h2 style='color:#22c55e;'>🎉 Setup Complete!</h2>";
     html += "<p>Scanner successfully linked to Gym: <b>" + foundGymId + "</b>.</p>";
-    html += "<p>You can close this window now. The scanner is online and ready!</p></body></html>";
+    html += "<p>Rebooting into Live Mode now... You can close this window!</p></body></html>";
     server.send(200, "text/html", html);
-    delay(1200); // Give phone browser time to receive the confirmation page
+    delay(2000); // Give phone browser time to receive confirmation page
 
-    // Seamlessly transition from Setup AP to normal Live Mode without rebooting!
-    dnsServer.stop();
-    server.close();
-    WiFi.softAPdisconnect(true);
-    isSetupMode = false;
-
-    // Update global variables
-    storedSSID = newSSID;
-    storedPassword = newPass;
-    storedLinkingKey = newKey;
-    linkedGymId = foundGymId;
-
-    Serial.println("\n🎉 Scanner is now ONLINE and ready for live member scans!\n");
-    playDroneArmedTones();
+    Serial.println("\n🔄 Setup complete! Rebooting ESP32 into Live Mode now...\n");
+    ESP.restart();
   } else {
     Serial.println("❌ Invalid Linking Key or verification failed!");
     String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
@@ -592,7 +589,9 @@ void startCaptivePortal() {
   Serial.println("📡 ENTERING WI-FI SETUP & CAPTIVE PORTAL");
   Serial.println("==========================================");
   
-  WiFi.disconnect(true);
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false); // Safe disconnect without zeroing config
+  delay(100);
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID);
   
@@ -635,11 +634,15 @@ void setup() {
 
   // Configure Pins
   pinMode(BUZZER_PIN, OUTPUT);
+  gpio_set_drive_capability((gpio_num_t)BUZZER_PIN, GPIO_DRIVE_CAP_3); // Max hardware drive strength (~40mA)
   digitalWrite(BUZZER_PIN, LOW);
   pinMode(TOUCH_PIN, INPUT_PULLUP);
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(RELAY_PIN, RELAY_INACTIVE_LEVEL); // Ensure door starts locked
   pinMode(EXIT_BUTTON_PIN, INPUT_PULLUP);
+
+  // Prevent ESP-IDF from auto-connecting with stale internal NVS settings
+  WiFi.persistent(false);
 
   // 1. Instantly play the 3 rising ESC initialization tones on power-on!
   playDronePowerUpTones();
@@ -673,6 +676,7 @@ void setup() {
   // Try connecting to saved Wi-Fi
   Serial.printf("📶 Connecting to saved Wi-Fi: %s", storedSSID.c_str());
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
   
   int timeout = 0;
@@ -690,6 +694,9 @@ void setup() {
     playDroneArmedTones();
   } else {
     Serial.println("\n⚠️ Failed to connect to saved Wi-Fi. Launching Setup Portal fallback...");
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(false, false);
+    delay(100);
     startCaptivePortal();
   }
 }
@@ -701,12 +708,18 @@ void loop() {
     return;
   }
 
-  // 1. Check Exit Button
+  // 1. Check Exit Button (Debounced)
   if (digitalRead(EXIT_BUTTON_PIN) == LOW) {
-    Serial.println("🚪 [EXIT] Interior Exit Button Pressed!");
-    triggerSolenoid(3);
-    logAccessEvent("EXIT", "INTERIOR_BUTTON", "Free exit");
-    delay(500);
+    delay(50); // Software debounce
+    if (digitalRead(EXIT_BUTTON_PIN) == LOW) {
+      Serial.println("🚪 [EXIT] Interior Exit Button Pressed!");
+      triggerSolenoid(3);
+      logAccessEvent("EXIT", "INTERIOR_BUTTON", "Free exit");
+      // Wait until button is released
+      while (digitalRead(EXIT_BUTTON_PIN) == LOW) {
+        delay(50);
+      }
+    }
   }
 
   // 2. Check Member Fingerprint Scan
