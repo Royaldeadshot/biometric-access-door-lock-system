@@ -48,37 +48,50 @@ const unsigned long ENROLL_CHECK_INTERVAL = 3000;
 // 2. ACTIVE BUZZER DRIVER (MAXIMUM LOUDNESS)
 // Active buzzers need full DC voltage (HIGH) to trigger their internal oscillator!
 // ==========================================
-void activeBeep(int durationMs) {
-  digitalWrite(BUZZER_PIN, HIGH); // Full 3.3V rail power
+// 2. AUDIO FEEDBACK & AUTHENTIC DRONE STARTUP TUNE
+// (Matching the Betaflight / BLHeli ESC DShot startup sound)
+// ==========================================
+
+void playToneNote(int freq, int durationMs, int pauseMs = 35) {
+  tone(BUZZER_PIN, freq);
   delay(durationMs);
-  digitalWrite(BUZZER_PIN, LOW);
+  noTone(BUZZER_PIN);
+  if (pauseMs > 0) delay(pauseMs);
 }
 
-// Drone Flight Controller (Betaflight / BLHeli) Startup Sequence for Active Buzzer
-void playDroneStartupSound() {
-  Serial.println("🔊 Playing High-Volume Drone FC startup sequence...");
-  // 3 quick chirps, pause, 2 confirmation chirps
-  activeBeep(80);
-  delay(50);
-  activeBeep(80);
-  delay(50);
-  activeBeep(160);
+// Exact Betaflight / BLHeli ESC Startup Chimes
+// Part 1: 3 Rising tones immediately on hardware power-up (ESC boot)
+void playDronePowerUpTones() {
+  Serial.println("🔊 [ESC BOOT] Playing 3 rising power-up tones...");
+  playToneNote(1175, 90, 35); // D6
+  playToneNote(1397, 90, 35); // F6
+  playToneNote(1760, 130, 0); // A6
+}
+
+// Part 2: 2 Confirmation tones when Wi-Fi & Cloud connect (FC handshake / Armed)
+void playDroneArmedTones() {
+  Serial.println("🔊 [FC ARMED] Playing 2 final connection confirmation tones...");
   delay(120);
-  activeBeep(80);
-  delay(50);
-  activeBeep(260);
+  playToneNote(1175, 95, 35); // D6
+  playToneNote(2349, 320, 0); // D7 (Long high confirmation)
 }
 
-// 1. Access Granted: 1 loud solid beep (~180ms)
+// Full chime helper
+void playDroneStartupSound() {
+  playDronePowerUpTones();
+  delay(160);
+  playDroneArmedTones();
+}
+
+// 1. Access Granted: Crisp high-volume resonant beep (~2700 Hz)
 void soundAccessGranted() {
-  activeBeep(180);
+  playToneNote(2700, 180, 0);
 }
 
-// 2. Access Denied (Expired): 3 rapid loud beeps
+// 2. Access Denied (Expired): 3 rapid warning beeps (~2200 Hz)
 void soundAccessDeniedExpired() {
   for (int i = 0; i < 3; i++) {
-    activeBeep(90);
-    if (i < 2) delay(90);
+    playToneNote(2200, 90, 90);
   }
 }
 
@@ -87,18 +100,16 @@ void soundAccessDeniedUnknown() {
   // Silent
 }
 
-// Enrollment Success Sound: 2 ascending sharp beeps
+// Enrollment Success Sound: 2 rising confirmation chirps
 void soundEnrollSuccess() {
-  activeBeep(90);
-  delay(70);
-  activeBeep(250);
+  playToneNote(1760, 90, 40);
+  playToneNote(2700, 240, 0);
 }
 
 // Setup Mode Notification: 2 quick alert beeps
 void soundConfigMode() {
-  activeBeep(120);
-  delay(90);
-  activeBeep(120);
+  playToneNote(2400, 110, 80);
+  playToneNote(2400, 110, 0);
 }
 
 // Hardware Placeholders
@@ -216,7 +227,8 @@ int verifyMemberInFirestore(uint8_t fingerId, String &memberName) {
   client.setInsecure();
   HTTPClient https;
   
-  String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents:runQuery";
+  String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + ":runQuery";
+  Serial.printf("\n📡 Checking cloud for Fingerprint #%d in Gym [%s]...\n", fingerId, linkedGymId.c_str());
   if (!https.begin(client, url)) return 0;
   
   https.addHeader("Content-Type", "application/json");
@@ -246,7 +258,13 @@ int verifyMemberInFirestore(uint8_t fingerId, String &memberName) {
       String status = extractJsonField(resp, "status");
       if (status == "active" || status == "") result = 1;
       else result = 2; // Expired
+      
+      Serial.printf("✅ Member Found: %s | Status: %s\n", memberName.c_str(), status.c_str());
+    } else {
+      Serial.println("ℹ️ No matching member record found for this fingerprint ID.");
     }
+  } else {
+    Serial.printf("❌ Firestore query failed. HTTP Code: %d\n", httpCode);
   }
   https.end();
   return result;
@@ -346,7 +364,7 @@ void runEnrollmentProcess() {
   }
   
   Serial.println("👍 Image 1 captured! Remove finger...");
-  activeBeep(80);
+  playToneNote(2000, 80, 0);
   delay(1000);
   p = 0;
   while (p != FINGERPRINT_NOFINGER) {
@@ -539,12 +557,24 @@ void handleSaveConfig() {
     String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
     html += "<h2 style='color:#22c55e;'>🎉 Setup Complete!</h2>";
     html += "<p>Scanner successfully linked to Gym: <b>" + foundGymId + "</b>.</p>";
-    html += "<p>The scanner will now restart and begin listening for member scans.</p></body></html>";
+    html += "<p>You can close this window now. The scanner is online and ready!</p></body></html>";
     server.send(200, "text/html", html);
+    delay(1200); // Give phone browser time to receive the confirmation page
 
-    playDroneStartupSound();
-    delay(2000);
-    ESP.restart();
+    // Seamlessly transition from Setup AP to normal Live Mode without rebooting!
+    dnsServer.stop();
+    server.close();
+    WiFi.softAPdisconnect(true);
+    isSetupMode = false;
+
+    // Update global variables
+    storedSSID = newSSID;
+    storedPassword = newPass;
+    storedLinkingKey = newKey;
+    linkedGymId = foundGymId;
+
+    Serial.println("\n🎉 Scanner is now ONLINE and ready for live member scans!\n");
+    playDroneArmedTones();
   } else {
     Serial.println("❌ Invalid Linking Key or verification failed!");
     String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
@@ -611,6 +641,9 @@ void setup() {
   digitalWrite(RELAY_PIN, LOW);
   pinMode(EXIT_BUTTON_PIN, INPUT_PULLUP);
 
+  // 1. Instantly play the 3 rising ESC initialization tones on power-on!
+  playDronePowerUpTones();
+
   // Initialize Fingerprint Sensor
   Serial2.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
   finger.begin(57600);
@@ -629,17 +662,6 @@ void setup() {
   storedLinkingKey = prefs.getString("key", "");
   linkedGymId = prefs.getString("gym_id", "");
   prefs.end();
-
-  // Check if user is holding touch sensor on boot to force Wi-Fi reset
-  if (digitalRead(TOUCH_PIN) == LOW) {
-    Serial.println("⚠️ Finger held on boot! Wiping Wi-Fi settings...");
-    prefs.begin("fitness_box", false);
-    prefs.clear();
-    prefs.end();
-    delay(1000);
-    startCaptivePortal();
-    return;
-  }
 
   // If no Wi-Fi credentials saved, enter Setup Portal immediately
   if (storedSSID == "" || storedLinkingKey == "") {
@@ -663,7 +685,9 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\n✅ Wi-Fi Connected! IP: " + WiFi.localIP().toString());
     Serial.println("🏢 Linked Gym ID: " + linkedGymId);
-    playDroneStartupSound();
+    
+    // 2. Play the 2 final confirmation tones now that we're connected & armed!
+    playDroneArmedTones();
   } else {
     Serial.println("\n⚠️ Failed to connect to saved Wi-Fi. Launching Setup Portal fallback...");
     startCaptivePortal();
