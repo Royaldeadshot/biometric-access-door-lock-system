@@ -22,10 +22,10 @@
 
 // Door Lock Relay (Solenoid)
 #define RELAY_PIN 25             // ESP32 GPIO 25 (Pin D25) -> Relay IN pin
-// Most relay modules are ACTIVE LOW or ACTIVE HIGH.
-// Set to HIGH if your relay triggers ON with HIGH, or LOW if your relay triggers ON with LOW.
-#define RELAY_ACTIVE_LEVEL HIGH
-#define RELAY_INACTIVE_LEVEL (!RELAY_ACTIVE_LEVEL)
+// Most 1-channel relay modules are ACTIVE LOW.
+// LOW (0V) triggers relay ON, HIGH (3.3V) turns relay OFF.
+#define RELAY_ACTIVE_LEVEL LOW
+#define RELAY_INACTIVE_LEVEL HIGH
 
 // Interior Push-to-Exit Button
 #define EXIT_BUTTON_PIN 27       // ESP32 GPIO 27 (Pin D27) -> Switch Pin 1. Switch Pin 2 -> GND
