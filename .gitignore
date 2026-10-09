@@ -1,0 +1,10 @@
+# Secret credentials - DO NOT COMMIT THIS FILE TO GIT!
+code/secrets.h
+secrets.h
+
+# Arduino / IDE build output
+*.bin
+*.elf
+*.hex
+.vscode/
+build/

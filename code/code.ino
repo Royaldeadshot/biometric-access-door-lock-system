@@ -5,6 +5,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <Adafruit_Fingerprint.h>
+#include "secrets.h"
 
 // ==========================================
 // 1. PIN DEFINITIONS
@@ -16,18 +17,12 @@
                           // (White Wire connects to ESP32 3.3V)
 
 // Audio & Hardware Feedback
-#define BUZZER_PIN 19     // Buzzer Positive (+) -> GPIO 19 (Pin 31). Negative (-) -> GND
+#define BUZZER_PIN 19     // Active Buzzer Positive (+) -> GPIO 19 (Pin 31). Negative (-) -> GND
 
 // Future Hardware Placeholders
 #define RELAY_PIN 25      // Solenoid Door Lock Relay Signal (Future)
 #define LED_PIN 18        // WS2812 / SK6812 LED Ring Data (Future)
 #define EXIT_BUTTON_PIN 27// Interior Push-to-Exit Button (Future, active low)
-
-// ==========================================
-// 2. SAAS CLOUD CONFIGURATION
-// ==========================================
-const char* FIREBASE_PROJECT_ID = "fitnessboxgym-23c2e";
-const char* FIREBASE_API_KEY = "AIzaSyAAtoSnk4d3NxuiWUbqJ3qY5F_LohmIa0w";
 
 // Captive Portal AP Name
 const char* AP_SSID = "FitnessBox-Scanner";
@@ -50,103 +45,133 @@ unsigned long lastEnrollCheck = 0;
 const unsigned long ENROLL_CHECK_INTERVAL = 3000;
 
 // ==========================================
-// 3. SOUND & AUDIO FEEDBACK
+// 2. ACTIVE BUZZER DRIVER (MAXIMUM LOUDNESS)
+// Active buzzers need full DC voltage (HIGH) to trigger their internal oscillator!
 // ==========================================
+void activeBeep(int durationMs) {
+  digitalWrite(BUZZER_PIN, HIGH); // Full 3.3V rail power
+  delay(durationMs);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// Drone Flight Controller (Betaflight / BLHeli) Startup Sequence for Active Buzzer
 void playDroneStartupSound() {
-  Serial.println("?? Playing Drone FC startup chime...");
-  int startupNotes[] = { 1046, 1318, 1568, 0, 1046, 2093 };
-  int durations[]    = {  100,  100,  160, 80,  120,  280 };
-  
-  for (int i = 0; i < 6; i++) {
-    if (startupNotes[i] > 0) {
-      tone(BUZZER_PIN, startupNotes[i], durations[i]);
-    }
-    delay(durations[i] + 30);
-  }
-  noTone(BUZZER_PIN);
+  Serial.println("🔊 Playing High-Volume Drone FC startup sequence...");
+  // 3 quick chirps, pause, 2 confirmation chirps
+  activeBeep(80);
+  delay(50);
+  activeBeep(80);
+  delay(50);
+  activeBeep(160);
+  delay(120);
+  activeBeep(80);
+  delay(50);
+  activeBeep(260);
 }
 
+// 1. Access Granted: 1 loud solid beep (~180ms)
 void soundAccessGranted() {
-  tone(BUZZER_PIN, 2000, 180);
-  delay(180);
-  noTone(BUZZER_PIN);
+  activeBeep(180);
 }
 
+// 2. Access Denied (Expired): 3 rapid loud beeps
 void soundAccessDeniedExpired() {
   for (int i = 0; i < 3; i++) {
-    tone(BUZZER_PIN, 900, 100);
-    delay(100);
-    noTone(BUZZER_PIN);
-    if (i < 2) delay(100);
+    activeBeep(90);
+    if (i < 2) delay(90);
   }
 }
 
+// 3. Access Denied (Not Recognized): Silent
 void soundAccessDeniedUnknown() {
   // Silent
 }
 
+// Enrollment Success Sound: 2 ascending sharp beeps
 void soundEnrollSuccess() {
-  tone(BUZZER_PIN, 1500, 100);
-  delay(120);
-  tone(BUZZER_PIN, 2200, 200);
-  delay(200);
-  noTone(BUZZER_PIN);
+  activeBeep(90);
+  delay(70);
+  activeBeep(250);
 }
 
+// Setup Mode Notification: 2 quick alert beeps
 void soundConfigMode() {
-  tone(BUZZER_PIN, 1200, 150);
-  delay(200);
-  tone(BUZZER_PIN, 1200, 150);
-  delay(200);
-  noTone(BUZZER_PIN);
+  activeBeep(120);
+  delay(90);
+  activeBeep(120);
 }
 
 // Hardware Placeholders
 void triggerSolenoid(int durationSeconds) {
-  Serial.printf("? [DOOR LOCK] Solenoid active for %d seconds\n", durationSeconds);
+  Serial.printf("⚡ [DOOR LOCK] Solenoid active for %d seconds\n", durationSeconds);
   digitalWrite(RELAY_PIN, HIGH);
   delay(durationSeconds * 1000);
   digitalWrite(RELAY_PIN, LOW);
-  Serial.println("?? [DOOR LOCK] Locked.");
+  Serial.println("🔒 [DOOR LOCK] Locked.");
 }
 
-void triggerLedAccessGranted()      { Serial.println("?? [LED RING] Green pulse"); }
-void triggerLedAccessDeniedExpired()  { Serial.println("?? [LED RING] Rapid red pulse"); }
-void triggerLedAccessDeniedUnknown()  { Serial.println("?? [LED RING] Amber steady"); }
-void triggerLedEnrollScanning()       { Serial.println("?? [LED RING] Yellow rotating"); }
-void triggerLedEnrollSuccess()        { Serial.println("?? [LED RING] Purple completion"); }
+void triggerLedAccessGranted()      { Serial.println("💡 [LED RING] Green pulse"); }
+void triggerLedAccessDeniedExpired()  { Serial.println("💡 [LED RING] Rapid red pulse"); }
+void triggerLedAccessDeniedUnknown()  { Serial.println("💡 [LED RING] Amber steady"); }
+void triggerLedEnrollScanning()       { Serial.println("💡 [LED RING] Yellow rotating"); }
+void triggerLedEnrollSuccess()        { Serial.println("💡 [LED RING] Purple completion"); }
 
 // ==========================================
-// 4. FIREBASE CLOUD LINKING & REST API
+// 3. SECURE JSON & CLOUD PARSER
+// Robust against newlines, spaces, and Firestore formatting
 // ==========================================
+String extractJsonField(const String &json, const String &fieldName) {
+  int fieldIdx = json.indexOf("\"" + fieldName + "\"");
+  if (fieldIdx == -1) return "";
+  
+  int valIdx = json.indexOf("\"stringValue\": \"", fieldIdx);
+  if (valIdx == -1) return "";
+  
+  int start = valIdx + 16;
+  int end = json.indexOf("\"", start);
+  if (end == -1) return "";
+  
+  return json.substring(start, end);
+}
 
-// Lookup Gym ID using the 6-digit Linking Key from the web dashboard
+// ==========================================
+// 4. FIREBASE CLOUD LINKING (TLS / HTTPS)
+// ==========================================
 String resolveGymIdFromLinkingKey(String key) {
-  if (WiFi.status() != WL_CONNECTED) return "";
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ Wi-Fi not connected!");
+    return "";
+  }
   
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setInsecure(); // Secure TLS connection over port 443
   HTTPClient https;
   
-  // 1. Direct document lookup in gym_links collection
   String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gym_links/" + key;
+  Serial.println("\n📡 [1/2] Secure HTTPS Query: " + url);
+  
   if (https.begin(client, url)) {
     int httpCode = https.GET();
+    String resp = https.getString();
+    Serial.printf("📡 HTTP Response Code: %d\n", httpCode);
+    
     if (httpCode == 200) {
-      String resp = https.getString();
-      int gymIdx = resp.indexOf("\"gym_id\": {\"stringValue\": \"");
-      if (gymIdx != -1) {
-        int endIdx = resp.indexOf("\"", gymIdx + 26);
-        String foundGym = resp.substring(gymIdx + 26, endIdx);
+      String foundGym = extractJsonField(resp, "gym_id");
+      if (foundGym.length() > 0) {
         https.end();
+        Serial.println("✅ Found Gym ID in gym_links: " + foundGym);
         return foundGym;
       }
+    } else {
+      Serial.println("📡 Server Response: " + resp);
     }
     https.end();
   }
   
-  // 2. Query fallback: search gyms where hardware_linking_key == key
+  // Structured query fallback
   url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents:runQuery";
+  Serial.println("📡 [2/2] Trying structured query fallback...");
+  
   if (https.begin(client, url)) {
     https.addHeader("Content-Type", "application/json");
     String query = "{"
@@ -164,13 +189,16 @@ String resolveGymIdFromLinkingKey(String key) {
     "}";
     
     int httpCode = https.POST(query);
+    String resp = https.getString();
+    Serial.printf("📡 Fallback HTTP Code: %d\n", httpCode);
+    
     if (httpCode == 200) {
-      String resp = https.getString();
       int nameIdx = resp.indexOf("/gyms/");
       if (nameIdx != -1) {
         int endIdx = resp.indexOf("\"", nameIdx + 6);
         String foundGym = resp.substring(nameIdx + 6, endIdx);
         https.end();
+        Serial.println("✅ Found Gym ID via query: " + foundGym);
         return foundGym;
       }
     }
@@ -181,7 +209,6 @@ String resolveGymIdFromLinkingKey(String key) {
 }
 
 // Verify member on scanner
-// Returns 1 = Active, 2 = Expired, 0 = Not Found
 int verifyMemberInFirestore(uint8_t fingerId, String &memberName) {
   if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return 0;
   
@@ -213,21 +240,12 @@ int verifyMemberInFirestore(uint8_t fingerId, String &memberName) {
   if (httpCode == 200) {
     String resp = https.getString();
     if (resp.indexOf("\"document\"") != -1) {
-      int nameIdx = resp.indexOf("\"name\": {\"stringValue\": \"");
-      if (nameIdx != -1) {
-        int endName = resp.indexOf("\"", nameIdx + 24);
-        memberName = resp.substring(nameIdx + 24, endName);
-      }
+      String name = extractJsonField(resp, "name");
+      if (name.length() > 0) memberName = name;
       
-      int statusIdx = resp.indexOf("\"status\": {\"stringValue\": \"");
-      String status = "active";
-      if (statusIdx != -1) {
-        int endStatus = resp.indexOf("\"", statusIdx + 26);
-        status = resp.substring(statusIdx + 26, endStatus);
-      }
-      
-      if (status == "active") result = 1;
-      else result = 2;
+      String status = extractJsonField(resp, "status");
+      if (status == "active" || status == "") result = 1;
+      else result = 2; // Expired
     }
   }
   https.end();
@@ -271,9 +289,10 @@ void checkEnrollmentRequest() {
   int httpCode = https.GET();
   if (httpCode == 200) {
     String resp = https.getString();
-    if (resp.indexOf("\"command\": {\"stringValue\": \"ENROLL\"}") != -1 &&
-        resp.indexOf("\"status\": {\"stringValue\": \"PENDING\"}") != -1) {
-      Serial.println("\n?? ENROLLMENT COMMAND RECEIVED FROM WEBSITE!");
+    String cmd = extractJsonField(resp, "command");
+    String st  = extractJsonField(resp, "status");
+    if (cmd == "ENROLL" && st == "PENDING") {
+      Serial.println("\n🌐 ENROLLMENT COMMAND RECEIVED FROM WEBSITE!");
       runEnrollmentProcess();
     }
   }
@@ -305,7 +324,7 @@ void updateEnrollmentStatus(String status, uint8_t fingerId) {
 // ==========================================
 void runEnrollmentProcess() {
   triggerLedEnrollScanning();
-  Serial.println("?? [ENROLL] Place finger on scanner (Touch 1)...");
+  Serial.println("👉 [ENROLL] Place finger on scanner (Touch 1)...");
   
   uint8_t nextSlot = 1;
   finger.getTemplateCount();
@@ -321,17 +340,13 @@ void runEnrollmentProcess() {
     p = finger.getImage();
     delay(50);
   }
-  if (p != FINGERPRINT_OK) {
-    updateEnrollmentStatus("ERROR", 0);
-    return;
-  }
-
-  if (finger.image2Tz(1) != FINGERPRINT_OK) {
+  if (p != FINGERPRINT_OK || finger.image2Tz(1) != FINGERPRINT_OK) {
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
   
-  Serial.println("?? Image 1 captured! Remove finger...");
+  Serial.println("👍 Image 1 captured! Remove finger...");
+  activeBeep(80);
   delay(1000);
   p = 0;
   while (p != FINGERPRINT_NOFINGER) {
@@ -340,7 +355,7 @@ void runEnrollmentProcess() {
   }
 
   // Touch 2
-  Serial.println("?? Place the SAME finger again (Touch 2)...");
+  Serial.println("👉 Place the SAME finger again (Touch 2)...");
   p = -1;
   timeout = millis() + 15000;
   while (p != FINGERPRINT_OK && millis() < timeout) {
@@ -353,13 +368,13 @@ void runEnrollmentProcess() {
   }
 
   if (finger.createModel() != FINGERPRINT_OK) {
-    Serial.println("? Fingerprints did not match.");
+    Serial.println("❌ Fingerprints did not match.");
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
 
   if (finger.storeModel(nextSlot) == FINGERPRINT_OK) {
-    Serial.printf("?? Enrolled into Slot #%d!\n", nextSlot);
+    Serial.printf("🎉 Enrolled into Slot #%d!\n", nextSlot);
     soundEnrollSuccess();
     triggerLedEnrollSuccess();
     updateEnrollmentStatus("SUCCESS", nextSlot);
@@ -372,7 +387,7 @@ void runEnrollmentProcess() {
 // 6. MEMBER VERIFICATION
 // ==========================================
 void handleFingerprintVerification() {
-  Serial.println("\n?? Finger detected. Reading...");
+  Serial.println("\n👆 Finger detected. Reading...");
   delay(250);
   
   uint8_t p = FINGERPRINT_NOFINGER;
@@ -383,13 +398,13 @@ void handleFingerprintVerification() {
   }
 
   if (p != FINGERPRINT_OK || finger.image2Tz() != FINGERPRINT_OK) {
-    Serial.println("?? Could not read fingerprint.");
+    Serial.println("⚠️ Could not read fingerprint.");
     delay(500);
     return;
   }
 
   if (finger.fingerFastSearch() != FINGERPRINT_OK) {
-    Serial.println("? Access Denied: Unknown Fingerprint.");
+    Serial.println("❌ Access Denied: Unknown Fingerprint.");
     triggerLedAccessDeniedUnknown();
     soundAccessDeniedUnknown();
     logAccessEvent("DENIED", "UNKNOWN", "Not recognized");
@@ -397,24 +412,24 @@ void handleFingerprintVerification() {
     return;
   }
 
-  Serial.printf("?? Recognized Slot #%d!\n", finger.fingerID);
+  Serial.printf("🔍 Recognized Slot #%d!\n", finger.fingerID);
   String memberName = "Member";
   int memberStatus = verifyMemberInFirestore(finger.fingerID, memberName);
   
   if (memberStatus == 1) {
-    Serial.printf("?? ACCESS GRANTED! Welcome, %s!\n", memberName.c_str());
+    Serial.printf("🟢 ACCESS GRANTED! Welcome, %s!\n", memberName.c_str());
     soundAccessGranted();
     triggerLedAccessGranted();
     logAccessEvent("GRANTED", String(finger.fingerID), "Active membership");
     triggerSolenoid(3);
   } else if (memberStatus == 2) {
-    Serial.printf("?? ACCESS DENIED: Membership Expired for %s.\n", memberName.c_str());
+    Serial.printf("🔴 ACCESS DENIED: Membership Expired for %s.\n", memberName.c_str());
     soundAccessDeniedExpired();
     triggerLedAccessDeniedExpired();
     logAccessEvent("DENIED", String(finger.fingerID), "Membership expired");
     delay(1500);
   } else {
-    Serial.println("?? Finger found in sensor but no cloud record.");
+    Serial.println("⚠️ Finger found in sensor but no cloud record.");
     triggerLedAccessDeniedUnknown();
     soundAccessDeniedUnknown();
     delay(1500);
@@ -422,10 +437,9 @@ void handleFingerprintVerification() {
 }
 
 // ==========================================
-// 7. CAPTIVE PORTAL & WEB SETUP SERVER
+// 7. CAPTIVE PORTAL SETUP SERVER
 // ==========================================
 String generatePortalHtml() {
-  // Scan for nearby Wi-Fi networks
   int n = WiFi.scanNetworks();
   String wifiOptions = "";
   for (int i = 0; i < n; ++i) {
@@ -438,21 +452,20 @@ String generatePortalHtml() {
   String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
   html += "<title>Fitness Box - Scanner Setup</title>";
   html += "<style>";
-  html += "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 90vh; }";
+  html += "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; display: flex; justify-content: center; align-items: center; min-height: 90vh; }";
   html += ".card { background: #1e293b; padding: 28px; border-radius: 20px; width: 100%; max-width: 380px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5); border: 1px solid #334155; }";
-  html += "h1 { font-size: 24px; font-weight: 800; color: #38bdf8; margin: 0 0 6px 0; display: flex; align-items: center; gap: 8px; }";
+  html += "h1 { font-size: 24px; font-weight: 800; color: #38bdf8; margin: 0 0 6px 0; }";
   html += "p { font-size: 14px; color: #94a3b8; margin: 0 0 24px 0; line-height: 1.5; }";
   html += "label { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #cbd5e1; display: block; margin-bottom: 6px; }";
   html += "input, select { width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: 10px; border: 1px solid #475569; background: #0f172a; color: #fff; font-size: 15px; margin-bottom: 18px; outline: none; }";
   html += "input:focus, select:focus { border-color: #38bdf8; box-shadow: 0 0 0 2px rgba(56,189,248,0.2); }";
   html += ".key-input { font-family: monospace; letter-spacing: 4px; font-size: 20px; text-align: center; font-weight: 700; color: #38bdf8; }";
   html += ".hint { font-size: 11px; color: #64748b; margin-top: -12px; margin-bottom: 18px; }";
-  html += "button { width: 100%; padding: 14px; background: #2563eb; color: #fff; border: none; border-radius: 12px; font-size: 16px; font-weight: 700; cursor: pointer; transition: background 0.2s; }";
-  html += "button:hover { background: #1d4ed8; }";
+  html += "button { width: 100%; padding: 14px; background: #2563eb; color: #fff; border: none; border-radius: 12px; font-size: 16px; font-weight: 700; cursor: pointer; }";
   html += "</style></head><body>";
   html += "<div class='card'>";
-  html += "<h1>??? Fitness Box</h1>";
-  html += "<p>Biometric Scanner Wi-Fi & SaaS Linking Setup</p>";
+  html += "<h1>🏋️ Fitness Box</h1>";
+  html += "<p>Biometric Scanner Setup</p>";
   html += "<form action='/save' method='POST'>";
   
   html += "<label>Gym Wi-Fi Network</label>";
@@ -482,18 +495,11 @@ void handleSaveConfig() {
   newPass.trim();
   newKey.trim();
 
-  Serial.println("\n?? Received Wi-Fi Setup Form:");
+  Serial.println("\n📥 Received Setup Request:");
   Serial.println("SSID: " + newSSID);
   Serial.println("Key: " + newKey);
 
-  // Send connecting page to user's phone
-  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<style>body{font-family:sans-serif;background:#0f172a;color:#fff;display:flex;justify-content:center;align-items:center;min-height:90vh;text-align:center;padding:20px;}.card{background:#1e293b;padding:30px;border-radius:20px;max-width:360px;}h2{color:#38bdf8;}</style></head><body>";
-  html += "<div class='card'><h2>Connecting...</h2><p>Attempting to connect to <b>" + newSSID + "</b> and linking with key <b>" + newKey + "</b>...</p><p>Please watch your ESP32 Serial Monitor or wait 10 seconds.</p></div></body></html>";
-  server.send(200, "text/html", html);
-  delay(1000);
-
-  // Attempt connection
+  // Connect to Wi-Fi
   WiFi.disconnect();
   WiFi.begin(newSSID.c_str(), newPass.c_str());
   
@@ -504,30 +510,48 @@ void handleSaveConfig() {
     attempts++;
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n? Connected to Wi-Fi! IP: " + WiFi.localIP().toString());
-    
-    // Resolve Gym ID
-    String foundGymId = resolveGymIdFromLinkingKey(newKey);
-    if (foundGymId != "") {
-      Serial.println("?? Successfully linked to Gym: " + foundGymId);
-      
-      // Save permanently to NVS flash
-      prefs.begin("fitness_box", false);
-      prefs.putString("ssid", newSSID);
-      prefs.putString("pass", newPass);
-      prefs.putString("key", newKey);
-      prefs.putString("gym_id", foundGymId);
-      prefs.end();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n❌ Wi-Fi Connection Failed!");
+    String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
+    html += "<h2 style='color:#ef4444;'>❌ Wi-Fi Connection Failed</h2>";
+    html += "<p>Could not connect to <b>" + newSSID + "</b>. Please check password.</p>";
+    html += "<a href='/' style='color:#38bdf8;text-decoration:none;font-weight:bold;'>&larr; Try Again</a></body></html>";
+    server.send(200, "text/html", html);
+    return;
+  }
 
-      playDroneStartupSound();
-      delay(2000);
-      ESP.restart(); // Restart into normal mode
-    } else {
-      Serial.println("? Invalid Linking Key! Could not find gym in database.");
-    }
+  Serial.println("\n✅ Connected to Wi-Fi! IP: " + WiFi.localIP().toString());
+  
+  // Resolve Gym ID
+  String foundGymId = resolveGymIdFromLinkingKey(newKey);
+  
+  if (foundGymId != "") {
+    Serial.println("🎉 Successfully linked to Gym: " + foundGymId);
+    
+    // Save permanently to NVS
+    prefs.begin("fitness_box", false);
+    prefs.putString("ssid", newSSID);
+    prefs.putString("pass", newPass);
+    prefs.putString("key", newKey);
+    prefs.putString("gym_id", foundGymId);
+    prefs.end();
+
+    String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
+    html += "<h2 style='color:#22c55e;'>🎉 Setup Complete!</h2>";
+    html += "<p>Scanner successfully linked to Gym: <b>" + foundGymId + "</b>.</p>";
+    html += "<p>The scanner will now restart and begin listening for member scans.</p></body></html>";
+    server.send(200, "text/html", html);
+
+    playDroneStartupSound();
+    delay(2000);
+    ESP.restart();
   } else {
-    Serial.println("? Failed to connect to Wi-Fi. Check password.");
+    Serial.println("❌ Invalid Linking Key or verification failed!");
+    String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
+    html += "<h2 style='color:#ef4444;'>❌ Linking Failed</h2>";
+    html += "<p>Connected to Wi-Fi, but could not link with key: <b>" + newKey + "</b>.</p>";
+    html += "<a href='/' style='color:#38bdf8;text-decoration:none;font-weight:bold;'>&larr; Try Again</a></body></html>";
+    server.send(200, "text/html", html);
   }
 }
 
@@ -535,7 +559,7 @@ void startCaptivePortal() {
   isSetupMode = true;
   soundConfigMode();
   Serial.println("\n==========================================");
-  Serial.println("?? ENTERING WI-FI SETUP & CAPTIVE PORTAL");
+  Serial.println("📡 ENTERING WI-FI SETUP & CAPTIVE PORTAL");
   Serial.println("==========================================");
   
   WiFi.disconnect(true);
@@ -548,17 +572,14 @@ void startCaptivePortal() {
   Serial.println("Broadcasting Wi-Fi: " + String(AP_SSID));
   Serial.println("Portal IP: http://192.168.4.1");
   
-  // Start DNS Server for Captive Portal (redirects all requests)
   dnsServer.start(53, "*", apIP);
   
-  // Web Server Routes
   server.on("/", HTTP_GET, []() {
     server.send(200, "text/html", generatePortalHtml());
   });
   
   server.on("/save", HTTP_POST, handleSaveConfig);
   
-  // Captive Portal probes redirect to home page
   server.on("/generate_204", []() { server.send(200, "text/html", generatePortalHtml()); });
   server.on("/gen_204", []() { server.send(200, "text/html", generatePortalHtml()); });
   server.on("/hotspot-detect.html", []() { server.send(200, "text/html", generatePortalHtml()); });
@@ -569,7 +590,7 @@ void startCaptivePortal() {
   });
   
   server.begin();
-  Serial.println("? Captive Portal Server Started. Waiting for gym owner...");
+  Serial.println("✅ Captive Portal Server Started. Waiting for gym owner...");
 }
 
 // ==========================================
@@ -579,11 +600,12 @@ void setup() {
   Serial.begin(9600);
   delay(1000);
   Serial.println("\n\n========================================");
-  Serial.println("??? FITNESS BOX - SMART BIOMETRIC SYSTEM");
+  Serial.println("🏋️ FITNESS BOX - SMART BIOMETRIC SYSTEM");
   Serial.println("========================================");
 
   // Configure Pins
   pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
   pinMode(TOUCH_PIN, INPUT_PULLUP);
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
@@ -595,9 +617,9 @@ void setup() {
   delay(50);
 
   if (finger.verifyPassword()) {
-    Serial.println("? Fingerprint Sensor (R307S): Ready!");
+    Serial.println("✅ Fingerprint Sensor (R307S): Ready!");
   } else {
-    Serial.println("? ERROR: Could not find Fingerprint sensor.");
+    Serial.println("❌ ERROR: Could not find Fingerprint sensor.");
   }
 
   // Load Saved Settings from Flash memory
@@ -610,7 +632,7 @@ void setup() {
 
   // Check if user is holding touch sensor on boot to force Wi-Fi reset
   if (digitalRead(TOUCH_PIN) == LOW) {
-    Serial.println("?? Finger held on boot! Wiping Wi-Fi settings...");
+    Serial.println("⚠️ Finger held on boot! Wiping Wi-Fi settings...");
     prefs.begin("fitness_box", false);
     prefs.clear();
     prefs.end();
@@ -621,13 +643,13 @@ void setup() {
 
   // If no Wi-Fi credentials saved, enter Setup Portal immediately
   if (storedSSID == "" || storedLinkingKey == "") {
-    Serial.println("?? No saved Wi-Fi or Linking Key found. Launching Setup Portal...");
+    Serial.println("ℹ️ No saved Wi-Fi or Linking Key found. Launching Setup Portal...");
     startCaptivePortal();
     return;
   }
 
   // Try connecting to saved Wi-Fi
-  Serial.printf("?? Connecting to saved Wi-Fi: %s", storedSSID.c_str());
+  Serial.printf("📶 Connecting to saved Wi-Fi: %s", storedSSID.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
   
@@ -639,27 +661,25 @@ void setup() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n? Wi-Fi Connected! IP: " + WiFi.localIP().toString());
-    Serial.println("?? Linked Gym ID: " + linkedGymId);
+    Serial.println("\n✅ Wi-Fi Connected! IP: " + WiFi.localIP().toString());
+    Serial.println("🏢 Linked Gym ID: " + linkedGymId);
     playDroneStartupSound();
   } else {
-    Serial.println("\n?? Failed to connect to saved Wi-Fi. Launching Setup Portal fallback...");
+    Serial.println("\n⚠️ Failed to connect to saved Wi-Fi. Launching Setup Portal fallback...");
     startCaptivePortal();
   }
 }
 
 void loop() {
-  // If in Captive Portal Setup Mode
   if (isSetupMode) {
     dnsServer.processNextRequest();
     server.handleClient();
-    return; // Don't run regular scanner logic in setup mode
+    return;
   }
 
-  // Normal Operating Mode:
   // 1. Check Exit Button
   if (digitalRead(EXIT_BUTTON_PIN) == LOW) {
-    Serial.println("?? [EXIT] Interior Exit Button Pressed!");
+    Serial.println("🚪 [EXIT] Interior Exit Button Pressed!");
     triggerSolenoid(3);
     logAccessEvent("EXIT", "INTERIOR_BUTTON", "Free exit");
     delay(500);
