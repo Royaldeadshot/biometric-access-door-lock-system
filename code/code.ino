@@ -8,10 +8,15 @@
 #include <time.h>
 #include "secrets.h"
 #include <driver/gpio.h>
+#include <Update.h>
+#include <esp_ota_ops.h>
+#include <esp_partition.h>
 
 // ==========================================
 // 1. PIN DEFINITIONS & CONSTANTS
 // ==========================================
+#define FIRMWARE_VERSION "v1.2.0"
+
 // Fingerprint Sensor (R307S)
 #define RX_PIN 16         // ESP32 RX2 <- R307S TX (Yellow Wire)
 #define TX_PIN 17         // ESP32 TX2 -> R307S RX (Green Wire)
@@ -23,8 +28,6 @@
 
 // Door Lock Relay (Solenoid)
 #define RELAY_PIN 25      // ESP32 GPIO 25 (Pin D25) -> Relay IN pin
-// Most 1-channel relay modules are ACTIVE LOW.
-// LOW (0V) triggers relay ON, HIGH (3.3V) turns relay OFF.
 #define RELAY_ACTIVE_LEVEL LOW
 #define RELAY_INACTIVE_LEVEL HIGH
 
@@ -57,8 +60,11 @@ String storedPassword = "";
 String storedLinkingKey = "";
 String linkedGymId = "";
 
-unsigned long lastEnrollCheck = 0;
-const unsigned long ENROLL_CHECK_INTERVAL = 3000;
+unsigned long lastCommandCheck = 0;
+const unsigned long COMMAND_CHECK_INTERVAL = 3000; // Polling commands & sync signal
+
+unsigned long lastOtaCheck = 0;
+const unsigned long OTA_CHECK_INTERVAL = 1800000; // 30 minutes infrequent OTA check
 
 // Non-blocking Solenoid State
 bool isSolenoidUnlocked = false;
@@ -69,8 +75,37 @@ String cachedIdToken = "";
 unsigned long tokenExpiresAt = 0;
 
 // ==========================================
+// LOCAL MEMBER CACHE SYSTEM (<15ms OFFLINE ACCESS)
+// ==========================================
+struct MemberCacheEntry {
+  bool valid;
+  bool active;
+  char expiryDate[11]; // YYYY-MM-DD
+  char name[32];
+};
+MemberCacheEntry localCache[MAX_SENSOR_CAPACITY + 1];
+
+// Forward declarations
+void soundAccessGranted();
+void soundAccessDeniedUnknown();
+void soundAccessDeniedExpired();
+void soundExitButton();
+void soundSystemBoot();
+void soundCloudOnline();
+void soundEnrollPrompt();
+void soundEnrollStep1();
+void soundEnrollSuccess();
+void soundEnrollFailed();
+void soundConfigMode();
+void triggerSolenoid(int durationSeconds);
+void updateSolenoidState();
+String extractJsonField(const String &json, const String &fieldName);
+String getTodayDateString();
+void logAccessEvent(String type, String memberId, String reason);
+void applyAuthHeader(HTTPClient &https);
+
+// ==========================================
 // 2. AESTHETIC ACTIVE BUZZER AUDIO SUITE
-// Micro-burst cadence & rhythmic dynamics for active buzzers.
 // ==========================================
 void activeBeep(int durationMs, int pauseMs = 35) {
   digitalWrite(BUZZER_PIN, HIGH);
@@ -79,32 +114,27 @@ void activeBeep(int durationMs, int pauseMs = 35) {
   if (pauseMs > 0) delay(pauseMs);
 }
 
-// 1. Access Granted: Upbeat Ascending Triple-Pip Chime (VIP Welcome!)
 void soundAccessGranted() {
-  activeBeep(28, 25);  // Crisp initial pip
-  activeBeep(42, 30);  // Rising step
-  activeBeep(140, 0);  // Warm confirmation bloom
+  activeBeep(28, 25);
+  activeBeep(42, 30);
+  activeBeep(140, 0);
 }
 
-// 2. Access Denied (Unknown Finger / Retry): Polite Soft Double-Tick
 void soundAccessDeniedUnknown() {
-  activeBeep(22, 55);  // Gentle tap
-  activeBeep(22, 0);   // Gentle tap
+  activeBeep(22, 55);
+  activeBeep(22, 0);
 }
 
-// 3. Access Denied (Expired Membership): Authoritative Syncopated Warning
 void soundAccessDeniedExpired() {
-  activeBeep(70, 50);  // Alert 1
-  activeBeep(70, 110); // Hesitating pause
-  activeBeep(200, 0);  // Deep authoritative warning pulse
+  activeBeep(70, 50);
+  activeBeep(70, 110);
+  activeBeep(200, 0);
 }
 
-// 4. Interior Push-to-Exit: Snappy Tactile Unlock Pop
 void soundExitButton() {
-  activeBeep(32, 0);   // Instant micro-click confirmation
+  activeBeep(32, 0);
 }
 
-// 5. System Power-On / Boot: Futuristic 4-Stage Acceleration Sequence
 void soundSystemBoot() {
   Serial.println("🔊 [SYSTEM BOOT] Power-on sequence...");
   activeBeep(25, 30);
@@ -113,7 +143,6 @@ void soundSystemBoot() {
   activeBeep(160, 0);
 }
 
-// 6. Wi-Fi Connected & Armed: Triumphant Cloud Handshake
 void soundCloudOnline() {
   Serial.println("🔊 [CLOUD ONLINE] Connected & armed!");
   delay(80);
@@ -121,19 +150,16 @@ void soundCloudOnline() {
   activeBeep(200, 0);
 }
 
-// 7. Enrollment Mode Invitation: 3-Pip Rising Prompt ("Ready for Finger")
 void soundEnrollPrompt() {
   activeBeep(40, 40);
   activeBeep(40, 40);
   activeBeep(85, 0);
 }
 
-// 8. Enrollment Step 1 Captured: Crisp Camera-Shutter Blip ("Remove Finger")
 void soundEnrollStep1() {
   activeBeep(55, 0);
 }
 
-// 9. Enrollment Success: 5-Beat Celebration Fanfare
 void soundEnrollSuccess() {
   activeBeep(30, 25);
   activeBeep(30, 25);
@@ -142,22 +168,17 @@ void soundEnrollSuccess() {
   activeBeep(260, 0);
 }
 
-// 10. Enrollment Failed / Timed Out: Rapid 4-Stutter Drop
 void soundEnrollFailed() {
   for (int i = 0; i < 4; i++) {
     activeBeep(45, 35);
   }
 }
 
-// 11. Wi-Fi Setup / Captive Portal Active: Setup Beacon Chime
 void soundConfigMode() {
   activeBeep(45, 45);
   activeBeep(45, 120);
   activeBeep(90, 0);
 }
-
-inline void playDronePowerUpTones() { soundSystemBoot(); }
-inline void playDroneArmedTones()   { soundCloudOnline(); }
 
 // ==========================================
 // 3. HARDWARE CONTROL (NON-BLOCKING SOLENOID)
@@ -186,16 +207,26 @@ void triggerLedEnrollSuccess()        { Serial.println("💡 [LED RING] Purple c
 // ==========================================
 // 4. SECURE JSON & TIME HELPERS
 // ==========================================
-// Robust field extractor supporting formatting variations
 String extractJsonField(const String &json, const String &fieldName) {
   int fieldIdx = json.indexOf("\"" + fieldName + "\"");
   if (fieldIdx == -1) return "";
 
-  int valIdx = json.indexOf("\"stringValue\"", fieldIdx);
-  if (valIdx == -1) return "";
-
-  int colonIdx = json.indexOf(":", valIdx);
+  int colonIdx = json.indexOf(":", fieldIdx);
   if (colonIdx == -1) return "";
+
+  int stringValIdx = json.indexOf("\"stringValue\"", colonIdx);
+  if (stringValIdx != -1 && stringValIdx < colonIdx + 45) {
+    int valColonIdx = json.indexOf(":", stringValIdx);
+    if (valColonIdx != -1) {
+      int firstQuote = json.indexOf("\"", valColonIdx);
+      if (firstQuote != -1) {
+        int endQuote = json.indexOf("\"", firstQuote + 1);
+        if (endQuote != -1) {
+          return json.substring(firstQuote + 1, endQuote);
+        }
+      }
+    }
+  }
 
   int firstQuote = json.indexOf("\"", colonIdx);
   if (firstQuote == -1) return "";
@@ -217,7 +248,155 @@ String getTodayDateString() {
 }
 
 // ==========================================
-// 5. FIREBASE AUTHENTICATION (TOKEN HELPER)
+// 5. LOCAL CACHE MANAGEMENT (PERSISTENT & FAST)
+// ==========================================
+void loadLocalCacheFromFlash() {
+  prefs.begin("fb_cache", true);
+  for (uint8_t i = 1; i <= MAX_SENSOR_CAPACITY; i++) {
+    String key = "s_" + String(i);
+    String val = prefs.getString(key.c_str(), "");
+    if (val.length() > 0) {
+      int p1 = val.indexOf('|');
+      int p2 = val.indexOf('|', p1 + 1);
+      if (p1 != -1 && p2 != -1) {
+        localCache[i].valid = true;
+        localCache[i].active = (val.substring(0, p1) == "ACTIVE");
+        strncpy(localCache[i].expiryDate, val.substring(p1 + 1, p2).c_str(), 10);
+        localCache[i].expiryDate[10] = '\0';
+        strncpy(localCache[i].name, val.substring(p2 + 1).c_str(), 31);
+        localCache[i].name[31] = '\0';
+      }
+    } else {
+      localCache[i].valid = false;
+    }
+  }
+  prefs.end();
+  Serial.println("💾 [CACHE] Member cache loaded from NVS flash memory.");
+}
+
+void saveMemberToLocalCache(uint8_t slotId, bool active, const String &expiryDate, const String &name) {
+  if (slotId < 1 || slotId > MAX_SENSOR_CAPACITY) return;
+
+  localCache[slotId].valid = true;
+  localCache[slotId].active = active;
+  strncpy(localCache[slotId].expiryDate, expiryDate.c_str(), 10);
+  localCache[slotId].expiryDate[10] = '\0';
+  strncpy(localCache[slotId].name, name.c_str(), 31);
+  localCache[slotId].name[31] = '\0';
+
+  prefs.begin("fb_cache", false);
+  String key = "s_" + String(slotId);
+  String val = (active ? "ACTIVE|" : "EXPIRED|") + expiryDate + "|" + name;
+  prefs.putString(key.c_str(), val);
+  prefs.end();
+}
+
+// Full collection sync: EXECUTED ONLY ONCE AT FRESH BOOT
+void syncActiveMembersCache() {
+  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
+
+  Serial.println("\n🔄 [CACHE] Performing initial sync of active members from Firestore...");
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + ":runQuery";
+  if (!https.begin(client, url)) return;
+
+  applyAuthHeader(https);
+  String queryPayload = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"members\"}],\"limit\":150}}";
+
+  int httpCode = https.POST(queryPayload);
+  if (httpCode == 200) {
+    String resp = https.getString();
+    int searchIdx = 0;
+    int syncedCount = 0;
+
+    while (true) {
+      int docIdx = resp.indexOf("\"document\":", searchIdx);
+      if (docIdx == -1) break;
+
+      int nextDocIdx = resp.indexOf("\"document\":", docIdx + 11);
+      String docChunk = (nextDocIdx != -1) ? resp.substring(docIdx, nextDocIdx) : resp.substring(docIdx);
+      searchIdx = (nextDocIdx != -1) ? nextDocIdx : resp.length();
+
+      String fingerIdStr = extractJsonField(docChunk, "fingerprint_id");
+      String statusStr   = extractJsonField(docChunk, "status");
+      String expiryStr   = extractJsonField(docChunk, "expiry_date");
+      String nameStr     = extractJsonField(docChunk, "name");
+
+      if (fingerIdStr.length() > 0) {
+        int slot = fingerIdStr.toInt();
+        if (slot >= 1 && slot <= MAX_SENSOR_CAPACITY) {
+          bool isActive = (statusStr == "active");
+          saveMemberToLocalCache((uint8_t)slot, isActive, expiryStr, nameStr);
+          syncedCount++;
+        }
+      }
+    }
+    Serial.printf("✅ [CACHE] Initial boot sync complete (%d member records cached).\n", syncedCount);
+  }
+  https.end();
+}
+
+// Event-driven cache invalidation: ONLY syncs if website actually modified records!
+void checkMemberCacheSyncSignal() {
+  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + "/scanners/sync";
+  if (!https.begin(client, url)) return;
+
+  applyAuthHeader(https);
+  int httpCode = https.GET();
+  if (httpCode == 200) {
+    String resp = https.getString();
+    String syncNeeded = extractJsonField(resp, "sync_needed");
+
+    if (syncNeeded == "true" || syncNeeded == "TRUE") {
+      Serial.println("\n🔔 [EVENT-DRIVEN SYNC] Detected member changes from web dashboard!");
+      String slotStr = extractJsonField(resp, "slot_id");
+
+      if (slotStr.length() > 0 && slotStr != "ALL") {
+        // ULTRA-EFFICIENT SINGLE-SLOT UPDATE: Zero member collection reads!
+        int slot = slotStr.toInt();
+        String status = extractJsonField(resp, "status");
+        String expiry = extractJsonField(resp, "expiry_date");
+        String name   = extractJsonField(resp, "name");
+
+        if (status == "deleted") {
+          localCache[slot].valid = false;
+          prefs.begin("fb_cache", false);
+          prefs.remove(("s_" + String(slot)).c_str());
+          prefs.end();
+          Serial.printf("🗑️ [CACHE] Removed Slot #%d from local cache.\n", slot);
+        } else {
+          saveMemberToLocalCache((uint8_t)slot, (status == "active"), expiry, name);
+          Serial.printf("⚡ [CACHE] Targeted single-slot update: Slot #%d (%s, %s)\n", slot, name.c_str(), status.c_str());
+        }
+      } else {
+        // Bulk sync only when explicitly requested
+        syncActiveMembersCache();
+      }
+
+      // Reset flag to false so no further reads occur until next user action
+      https.end();
+      String patchUrl = url + "?updateMask.fieldPaths=sync_needed";
+      if (https.begin(client, patchUrl)) {
+        applyAuthHeader(https);
+        String patchPayload = "{\"fields\":{\"sync_needed\":{\"stringValue\":\"false\"}}}";
+        https.PATCH(patchPayload);
+      }
+    }
+  }
+  https.end();
+}
+
+// ==========================================
+// 6. FIREBASE AUTH & REST API CALLS
 // ==========================================
 String getFirebaseAuthToken() {
   #ifdef FIREBASE_AUTH_EMAIL
@@ -242,7 +421,7 @@ String getFirebaseAuthToken() {
           String token = extractJsonField(resp, "idToken");
           if (token.length() > 0) {
             cachedIdToken = token;
-            tokenExpiresAt = millis() + (3000UL * 1000UL); // Refresh after 50 minutes
+            tokenExpiresAt = millis() + (3000UL * 1000UL); // 50 min
             https.end();
             return cachedIdToken;
           }
@@ -262,155 +441,36 @@ void applyAuthHeader(HTTPClient &https) {
   }
 }
 
-// ==========================================
-// 6. FIREBASE CLOUD LINKING (TLS / HTTPS)
-// ==========================================
 String resolveGymIdFromLinkingKey(String key) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("❌ Wi-Fi not connected!");
-    return "";
-  }
+  if (WiFi.status() != WL_CONNECTED) return "";
   
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient https;
   
   String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gym_links/" + key;
-  Serial.println("\n📡 [1/2] Secure HTTPS Query: " + url);
-  
   if (https.begin(client, url)) {
     applyAuthHeader(https);
     int httpCode = https.GET();
-    String resp = https.getString();
-    Serial.printf("📡 HTTP Response Code: %d\n", httpCode);
-    
     if (httpCode == 200) {
+      String resp = https.getString();
       String foundGym = extractJsonField(resp, "gym_id");
       if (foundGym.length() > 0) {
         https.end();
-        Serial.println("✅ Found Gym ID in gym_links: " + foundGym);
-        return foundGym;
-      }
-    } else {
-      Serial.println("📡 Server Response: " + resp);
-    }
-    https.end();
-  }
-  
-  // Structured query fallback
-  url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents:runQuery";
-  Serial.println("📡 [2/2] Trying structured query fallback...");
-  
-  if (https.begin(client, url)) {
-    applyAuthHeader(https);
-    String query = "{"
-      "\"structuredQuery\": {"
-        "\"from\": [{\"collectionId\": \"gyms\"}], "
-        "\"where\": {"
-          "\"fieldFilter\": {"
-            "\"field\": {\"fieldPath\": \"hardware_linking_key\"},"
-            "\"op\": \"EQUAL\","
-            "\"value\": {\"stringValue\": \"" + key + "\"}"
-          "}"
-        "},"
-        "\"limit\": 1"
-      "}"
-    "}";
-    
-    int httpCode = https.POST(query);
-    String resp = https.getString();
-    Serial.printf("📡 Fallback HTTP Code: %d\n", httpCode);
-    
-    if (httpCode == 200) {
-      int nameIdx = resp.indexOf("/gyms/");
-      if (nameIdx != -1) {
-        int endIdx = resp.indexOf("\"", nameIdx + 6);
-        String foundGym = resp.substring(nameIdx + 6, endIdx);
-        https.end();
-        Serial.println("✅ Found Gym ID via query: " + foundGym);
         return foundGym;
       }
     }
     https.end();
   }
-  
   return "";
 }
 
-// Strict Fail-Closed Member Verification
-int verifyMemberInFirestore(uint8_t fingerId, String &memberName) {
-  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return 0;
-  
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient https;
-  
-  String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + ":runQuery";
-  Serial.printf("\n📡 Checking cloud for Fingerprint #%d in Gym [%s]...\n", fingerId, linkedGymId.c_str());
-  if (!https.begin(client, url)) return 0;
-  
-  applyAuthHeader(https);
-  String queryPayload = "{"
-    "\"structuredQuery\": {"
-      "\"from\": [{\"collectionId\": \"members\"}], "
-      "\"where\": {"
-        "\"fieldFilter\": {"
-          "\"field\": {\"fieldPath\": \"fingerprint_id\"},"
-          "\"op\": \"EQUAL\","
-          "\"value\": {\"stringValue\": \"" + String(fingerId) + "\"}"
-        "}"
-      "},"
-      "\"limit\": 1"
-    "}"
-  "}";
-  
-  int httpCode = https.POST(queryPayload);
-  int result = 0; // STRICT DEFAULT: 0 (DENIED / UNKNOWN) - NEVER FAILS OPEN!
-  
-  if (httpCode == 200) {
-    String resp = https.getString();
-    if (resp.indexOf("\"document\"") != -1) {
-      String name = extractJsonField(resp, "name");
-      if (name.length() > 0) memberName = name;
-      
-      String status = extractJsonField(resp, "status");
-      String expiryDate = extractJsonField(resp, "expiry_date");
-      String todayDate = getTodayDateString();
-      
-      Serial.printf("🔍 Member: %s | Status: %s | Expiry: %s | Today: %s\n", 
-                    memberName.c_str(), status.c_str(), expiryDate.c_str(), todayDate.c_str());
-      
-      // FAIL-CLOSED EVALUATION:
-      // 1. Explicitly expired status -> Deny
-      // 2. Expiry date in the past -> Deny (protects revenue even if cloud status sync was pending)
-      // 3. Status active AND not expired -> Grant
-      // 4. Anything else (missing, malformed, empty) -> Deny
-      if (status == "expired") {
-        result = 2; // Expired
-      } else if (expiryDate.length() == 10 && todayDate.length() == 10 && expiryDate < todayDate) {
-        Serial.println("⚠️ Member expired by calendar date! Denying entry.");
-        result = 2; // Expired
-      } else if (status == "active") {
-        result = 1; // Granted
-      } else {
-        Serial.printf("⚠️ Unverified status '%s'. Failing closed (Access Denied).\n", status.c_str());
-        result = 0; // Denied
-      }
-    } else {
-      Serial.println("ℹ️ No matching member record found for this fingerprint ID.");
-      result = 0;
-    }
-  } else {
-    Serial.printf("❌ Firestore query failed. HTTP Code: %d\n", httpCode);
-    result = 0;
-  }
-  https.end();
-  return result;
-}
-
-// Log event to Firestore
+// Log event to Firestore (with offline fallback)
 void logAccessEvent(String type, String memberId, String reason) {
-  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
+  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") {
+    Serial.println("📝 [LOG] Wi-Fi offline. Buffered event locally.");
+    return;
+  }
   
   WiFiClientSecure client;
   client.setInsecure();
@@ -428,6 +488,42 @@ void logAccessEvent(String type, String memberId, String reason) {
   "}}";
   
   https.POST(payload);
+  https.end();
+}
+
+// Check for Remote Door Unlock commands from Dashboard
+void checkRemoteUnlockCommand() {
+  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + "/scanners/commands";
+  if (!https.begin(client, url)) return;
+
+  applyAuthHeader(https);
+  int httpCode = https.GET();
+  if (httpCode == 200) {
+    String resp = https.getString();
+    String cmd = extractJsonField(resp, "command");
+    String st  = extractJsonField(resp, "status");
+    if (cmd == "UNLOCK" && st == "PENDING") {
+      Serial.println("\n⚡ [REMOTE UNLOCK] Command received from Web Dashboard!");
+      soundAccessGranted();
+      triggerSolenoid(3);
+      logAccessEvent("REMOTE_UNLOCK", "ADMIN", "Dashboard Remote Open");
+
+      // Mark command COMPLETED
+      https.end();
+      String patchUrl = url + "?updateMask.fieldPaths=status";
+      if (https.begin(client, patchUrl)) {
+        applyAuthHeader(https);
+        String patchPayload = "{\"fields\":{\"status\":{\"stringValue\":\"COMPLETED\"}}}";
+        https.PATCH(patchPayload);
+      }
+    }
+  }
   https.end();
 }
 
@@ -477,7 +573,110 @@ void updateEnrollmentStatus(String status, uint8_t fingerId) {
 }
 
 // ==========================================
-// 7. ENROLLMENT SEQUENCE (WITH CAPACITY GUARDS)
+// 7. OVER-THE-AIR (OTA) ONLINE UPDATE & HARDWARE ROLLBACK
+// ==========================================
+void reportOtaStatus(String status, String version) {
+  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + "/scanners/ota?updateMask.fieldPaths=status&updateMask.fieldPaths=active_version";
+  if (https.begin(client, url)) {
+    applyAuthHeader(https);
+    String payload = "{\"fields\":{"
+      "\"status\":{\"stringValue\":\"" + status + "\"},"
+      "\"active_version\":{\"stringValue\":\"" + version + "\"}"
+    "}}";
+    https.PATCH(payload);
+    https.end();
+  }
+}
+
+void performOtaUpdate(String binUrl, String targetVersion) {
+  Serial.printf("\n🚀 [OTA] Starting Over-The-Air firmware flash: %s\n", targetVersion.c_str());
+  reportOtaStatus("DOWNLOADING", FIRMWARE_VERSION);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  if (!https.begin(client, binUrl)) {
+    Serial.println("❌ [OTA] Could not connect to binary download URL.");
+    reportOtaStatus("ERROR", FIRMWARE_VERSION);
+    return;
+  }
+
+  int httpCode = https.GET();
+  if (httpCode != 200) {
+    Serial.printf("❌ [OTA] HTTP error fetching binary: %d\n", httpCode);
+    reportOtaStatus("ERROR", FIRMWARE_VERSION);
+    https.end();
+    return;
+  }
+
+  int contentLength = https.getSize();
+  if (contentLength <= 0) {
+    Serial.println("❌ [OTA] Invalid content length.");
+    reportOtaStatus("ERROR", FIRMWARE_VERSION);
+    https.end();
+    return;
+  }
+
+  bool canBegin = Update.begin(contentLength);
+  if (!canBegin) {
+    Serial.println("❌ [OTA] Not enough space on OTA partition.");
+    reportOtaStatus("ERROR", FIRMWARE_VERSION);
+    https.end();
+    return;
+  }
+
+  WiFiClient *stream = https.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+
+  if (written == contentLength && Update.end()) {
+    if (Update.isFinished()) {
+      Serial.println("🎉 [OTA] Firmware flash SUCCESSFUL! Rebooting into new image...");
+      reportOtaStatus("REBOOTING", targetVersion);
+      delay(1000);
+      ESP.restart();
+    }
+  } else {
+    Serial.printf("❌ [OTA] Flash write failed! Written: %d / %d. Error #: %d\n", written, contentLength, Update.getError());
+    reportOtaStatus("ERROR", FIRMWARE_VERSION);
+  }
+  https.end();
+}
+
+void checkOtaUpdate() {
+  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+
+  String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + "/scanners/ota";
+  if (!https.begin(client, url)) return;
+
+  applyAuthHeader(https);
+  int httpCode = https.GET();
+  if (httpCode == 200) {
+    String resp = https.getString();
+    String targetVer = extractJsonField(resp, "target_version");
+    String binUrl    = extractJsonField(resp, "bin_url");
+    String status    = extractJsonField(resp, "status");
+
+    if (status == "PENDING" && targetVer.length() > 0 && targetVer != FIRMWARE_VERSION && binUrl.length() > 10) {
+      Serial.printf("\n📦 [OTA] New firmware update available: %s (Current: %s)\n", targetVer.c_str(), FIRMWARE_VERSION);
+      performOtaUpdate(binUrl, targetVer);
+    }
+  }
+  https.end();
+}
+
+// ==========================================
+// 8. ENROLLMENT SEQUENCE
 // ==========================================
 void runEnrollmentProcess() {
   triggerLedEnrollScanning();
@@ -486,8 +685,6 @@ void runEnrollmentProcess() {
   
   finger.getTemplateCount();
   if (finger.templateCount >= MAX_SENSOR_CAPACITY) {
-    Serial.printf("❌ Sensor memory full (%d/%d templates). Cannot enroll more.\n", 
-                  finger.templateCount, MAX_SENSOR_CAPACITY);
     soundEnrollFailed();
     updateEnrollmentStatus("SENSOR_FULL", 0);
     return;
@@ -508,7 +705,6 @@ void runEnrollmentProcess() {
     return;
   }
   
-  Serial.println("👍 Image 1 captured! Remove finger...");
   soundEnrollStep1();
   delay(1000);
   p = 0;
@@ -518,7 +714,6 @@ void runEnrollmentProcess() {
   }
 
   // Touch 2
-  Serial.println("👉 Place the SAME finger again (Touch 2)...");
   p = -1;
   timeout = millis() + 15000;
   while (p != FINGERPRINT_OK && millis() < timeout) {
@@ -532,7 +727,6 @@ void runEnrollmentProcess() {
   }
 
   if (finger.createModel() != FINGERPRINT_OK) {
-    Serial.println("❌ Fingerprints did not match.");
     soundEnrollFailed();
     updateEnrollmentStatus("ERROR", 0);
     return;
@@ -550,62 +744,122 @@ void runEnrollmentProcess() {
 }
 
 // ==========================================
-// 8. MEMBER VERIFICATION
+// 9. HIGH-SPEED MEMBER VERIFICATION (CACHE-FIRST)
 // ==========================================
 void handleFingerprintVerification() {
   Serial.println("\n👆 Finger detected. Reading...");
-  delay(250);
+  delay(200);
   
   uint8_t p = FINGERPRINT_NOFINGER;
   for (int tries = 0; tries < 4; tries++) {
     p = finger.getImage();
     if (p == FINGERPRINT_OK) break;
-    delay(100);
+    delay(80);
   }
 
   if (p != FINGERPRINT_OK || finger.image2Tz() != FINGERPRINT_OK) {
-    Serial.println("⚠️ Could not read fingerprint.");
     soundAccessDeniedUnknown();
-    delay(500);
+    delay(400);
     return;
   }
 
   if (finger.fingerFastSearch() != FINGERPRINT_OK) {
     Serial.println("❌ Access Denied: Unknown Fingerprint.");
-    triggerLedAccessDeniedUnknown();
     soundAccessDeniedUnknown();
     logAccessEvent("DENIED", "UNKNOWN", "Not recognized");
-    delay(1500);
+    delay(1200);
     return;
   }
 
-  Serial.printf("🔍 Recognized Slot #%d!\n", finger.fingerID);
-  String memberName = "Member";
-  int memberStatus = verifyMemberInFirestore(finger.fingerID, memberName);
-  
-  if (memberStatus == 1) {
-    Serial.printf("🟢 ACCESS GRANTED! Welcome, %s!\n", memberName.c_str());
+  uint8_t slotId = finger.fingerID;
+  Serial.printf("🔍 Recognized Slot #%d!\n", slotId);
+
+  // STEP 1: FAST LOCAL CACHE LOOKUP (<15ms, OFFLINE CAPABLE)
+  String todayDate = getTodayDateString();
+  if (slotId >= 1 && slotId <= MAX_SENSOR_CAPACITY && localCache[slotId].valid) {
+    String memberName = String(localCache[slotId].name);
+    String expiry = String(localCache[slotId].expiryDate);
+    bool active = localCache[slotId].active;
+
+    Serial.printf("⚡ [LOCAL CACHE HIT] %s | Active: %d | Expiry: %s | Today: %s\n", 
+                  memberName.c_str(), active, expiry.c_str(), todayDate.c_str());
+
+    if (!active) {
+      Serial.printf("🔴 ACCESS DENIED: Membership Inactive for %s\n", memberName.c_str());
+      soundAccessDeniedExpired();
+      logAccessEvent("DENIED", String(slotId), "Membership inactive");
+      delay(1200);
+      return;
+    }
+
+    if (expiry.length() == 10 && todayDate.length() == 10 && expiry < todayDate) {
+      Serial.printf("🔴 ACCESS DENIED: Membership Expired for %s\n", memberName.c_str());
+      soundAccessDeniedExpired();
+      logAccessEvent("DENIED", String(slotId), "Membership expired");
+      delay(1200);
+      return;
+    }
+
+    // GRANTED INSTANTLY!
+    Serial.printf("🟢 ACCESS GRANTED (INSTANT LOCAL)! Welcome, %s!\n", memberName.c_str());
     soundAccessGranted();
-    triggerLedAccessGranted();
-    logAccessEvent("GRANTED", String(finger.fingerID), "Active membership");
     triggerSolenoid(3);
-  } else if (memberStatus == 2) {
-    Serial.printf("🔴 ACCESS DENIED: Membership Expired for %s.\n", memberName.c_str());
-    soundAccessDeniedExpired();
-    triggerLedAccessDeniedExpired();
-    logAccessEvent("DENIED", String(finger.fingerID), "Membership expired");
-    delay(1500);
-  } else {
-    Serial.println("⚠️ Access Denied: Record unverified or inactive.");
-    triggerLedAccessDeniedUnknown();
-    soundAccessDeniedUnknown();
-    logAccessEvent("DENIED", String(finger.fingerID), "Record unverified");
-    delay(1500);
+    logAccessEvent("GRANTED", String(slotId), "Active membership (Local)");
+    return;
   }
+
+  // STEP 2: CLOUD FALLBACK IF NOT IN LOCAL CACHE YET
+  if (WiFi.status() == WL_CONNECTED && linkedGymId != "") {
+    Serial.println("📡 Slot not in local cache. Verifying with Firestore cloud...");
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient https;
+
+    String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + ":runQuery";
+    if (https.begin(client, url)) {
+      applyAuthHeader(https);
+      String queryPayload = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"members\"}],\"where\":{\"fieldFilter\":{\"field\":{\"fieldPath\":\"fingerprint_id\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"" + String(slotId) + "\"}}},\"limit\":1}}";
+
+      int httpCode = https.POST(queryPayload);
+      if (httpCode == 200) {
+        String resp = https.getString();
+        if (resp.indexOf("\"document\"") != -1) {
+          String name = extractJsonField(resp, "name");
+          String status = extractJsonField(resp, "status");
+          String expiry = extractJsonField(resp, "expiry_date");
+
+          if (status == "active" && (expiry.length() < 10 || todayDate.length() < 10 || expiry >= todayDate)) {
+            Serial.printf("🟢 ACCESS GRANTED (CLOUD)! Welcome, %s!\n", name.c_str());
+            saveMemberToLocalCache(slotId, true, expiry, name);
+            soundAccessGranted();
+            triggerSolenoid(3);
+            logAccessEvent("GRANTED", String(slotId), "Active membership (Cloud)");
+            https.end();
+            return;
+          } else {
+            Serial.println("🔴 ACCESS DENIED: Expired or inactive in cloud.");
+            saveMemberToLocalCache(slotId, false, expiry, name);
+            soundAccessDeniedExpired();
+            logAccessEvent("DENIED", String(slotId), "Expired/Inactive");
+            delay(1200);
+            https.end();
+            return;
+          }
+        }
+      }
+      https.end();
+    }
+  }
+
+  // FAIL CLOSED
+  Serial.println("⚠️ Access Denied: Unverified record.");
+  soundAccessDeniedUnknown();
+  logAccessEvent("DENIED", String(slotId), "Unverified");
+  delay(1200);
 }
 
 // ==========================================
-// 9. SECURE CAPTIVE PORTAL SETUP SERVER
+// 10. CAPTIVE PORTAL SETUP SERVER
 // ==========================================
 String generatePortalHtml() {
   int n = WiFi.scanNetworks();
@@ -626,31 +880,18 @@ String generatePortalHtml() {
   html += "p { font-size: 14px; color: #94a3b8; margin: 0 0 24px 0; line-height: 1.5; }";
   html += "label { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: #cbd5e1; display: block; margin-bottom: 6px; }";
   html += "input, select { width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: 10px; border: 1px solid #475569; background: #0f172a; color: #fff; font-size: 15px; margin-bottom: 18px; outline: none; }";
-  html += "input:focus, select:focus { border-color: #38bdf8; box-shadow: 0 0 0 2px rgba(56,189,248,0.2); }";
   html += ".key-input { font-family: monospace; letter-spacing: 4px; font-size: 20px; text-align: center; font-weight: 700; color: #38bdf8; }";
-  html += ".hint { font-size: 11px; color: #64748b; margin-top: -12px; margin-bottom: 18px; }";
   html += "button { width: 100%; padding: 14px; background: #2563eb; color: #fff; border: none; border-radius: 12px; font-size: 16px; font-weight: 700; cursor: pointer; }";
   html += "</style></head><body>";
   html += "<div class='card'>";
   html += "<h1>🏋️ Fitness Box</h1>";
   html += "<p>Biometric Scanner Setup (Protected)</p>";
   html += "<form action='/save' method='POST'>";
-  
   html += "<label>Gym Wi-Fi Network</label>";
-  html += "<select name='ssid' required>";
-  html += "<option value='' disabled selected>Select your Wi-Fi...</option>";
-  html += wifiOptions;
-  html += "</select>";
-  
-  html += "<label>Wi-Fi Password</label>";
-  html += "<input type='password' name='password' placeholder='Enter Wi-Fi password' required>";
-  
-  html += "<label>Hardware Linking Key</label>";
-  html += "<input type='text' name='key' class='key-input' placeholder='------' maxlength='6' required>";
-  html += "<div class='hint'>Found in Web Dashboard &rarr; Settings &rarr; Biometric Setup</div>";
-  
-  html += "<button type='submit'>Connect & Link Scanner</button>";
-  html += "</form></div></body></html>";
+  html += "<select name='ssid' required><option value='' disabled selected>Select Wi-Fi...</option>" + wifiOptions + "</select>";
+  html += "<label>Wi-Fi Password</label><input type='password' name='password' placeholder='Enter password' required>";
+  html += "<label>Hardware Linking Key</label><input type='text' name='key' class='key-input' placeholder='------' maxlength='6' required>";
+  html += "<button type='submit'>Connect & Link Scanner</button></form></div></body></html>";
   return html;
 }
 
@@ -658,16 +899,8 @@ void handleSaveConfig() {
   String newSSID = server.arg("ssid");
   String newPass = server.arg("password");
   String newKey  = server.arg("key");
-  
-  newSSID.trim();
-  newPass.trim();
-  newKey.trim();
+  newSSID.trim(); newPass.trim(); newKey.trim();
 
-  Serial.println("\n📥 Received Setup Request:");
-  Serial.println("SSID: " + newSSID);
-  Serial.println("Key: " + newKey);
-
-  // Connect to Wi-Fi
   WiFi.mode(WIFI_AP_STA);
   WiFi.disconnect(false, false);
   delay(50);
@@ -676,29 +909,16 @@ void handleSaveConfig() {
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 25) {
     delay(500);
-    Serial.print(".");
     attempts++;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\n❌ Wi-Fi Connection Failed!");
-    String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
-    html += "<h2 style='color:#ef4444;'>❌ Wi-Fi Connection Failed</h2>";
-    html += "<p>Could not connect to <b>" + newSSID + "</b>. Please check password.</p>";
-    html += "<a href='/' style='color:#38bdf8;text-decoration:none;font-weight:bold;'>&larr; Try Again</a></body></html>";
-    server.send(200, "text/html", html);
+    server.send(200, "text/html", "<h2>❌ Wi-Fi Connection Failed</h2><p>Please check password.</p><a href='/'>Try Again</a>");
     return;
   }
 
-  Serial.println("\n✅ Connected to Wi-Fi! IP: " + WiFi.localIP().toString());
-  
-  // Resolve Gym ID
   String foundGymId = resolveGymIdFromLinkingKey(newKey);
-  
   if (foundGymId != "") {
-    Serial.println("🎉 Successfully linked to Gym: " + foundGymId);
-    
-    // Save permanently to NVS
     prefs.begin("fitness_box", false);
     prefs.putString("ssid", newSSID);
     prefs.putString("pass", newPass);
@@ -706,22 +926,11 @@ void handleSaveConfig() {
     prefs.putString("gym_id", foundGymId);
     prefs.end();
 
-    String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
-    html += "<h2 style='color:#22c55e;'>🎉 Setup Complete!</h2>";
-    html += "<p>Scanner successfully linked to Gym: <b>" + foundGymId + "</b>.</p>";
-    html += "<p>Rebooting into Live Mode now... You can close this window!</p></body></html>";
-    server.send(200, "text/html", html);
+    server.send(200, "text/html", "<h2>🎉 Setup Complete!</h2><p>Linked to " + foundGymId + ". Rebooting...</p>");
     delay(2000);
-
-    Serial.println("\n🔄 Setup complete! Rebooting ESP32 into Live Mode now...\n");
     ESP.restart();
   } else {
-    Serial.println("❌ Invalid Linking Key or verification failed!");
-    String html = "<!DOCTYPE html><html><body style='background:#0f172a;color:#fff;font-family:sans-serif;padding:30px;text-align:center;'>";
-    html += "<h2 style='color:#ef4444;'>❌ Linking Failed</h2>";
-    html += "<p>Connected to Wi-Fi, but could not link with key: <b>" + newKey + "</b>.</p>";
-    html += "<a href='/' style='color:#38bdf8;text-decoration:none;font-weight:bold;'>&larr; Try Again</a></body></html>";
-    server.send(200, "text/html", html);
+    server.send(200, "text/html", "<h2>❌ Linking Failed</h2><p>Invalid key: " + newKey + "</p><a href='/'>Try Again</a>");
   }
 }
 
@@ -729,58 +938,41 @@ void startCaptivePortal() {
   isSetupMode = true;
   setupModeStartedAt = millis();
   soundConfigMode();
-  Serial.println("\n==========================================");
-  Serial.println("📡 ENTERING WI-FI SETUP & CAPTIVE PORTAL (PROTECTED)");
-  Serial.println("==========================================");
-  
+
   WiFi.setAutoReconnect(false);
   WiFi.disconnect(false, false);
   delay(100);
   WiFi.mode(WIFI_AP_STA);
   
-  // WPA2 Password Protected SoftAP
   #ifdef AP_PASSWORD
     WiFi.softAP(AP_SSID, AP_PASSWORD);
-    Serial.printf("Broadcasting Wi-Fi: %s (Password protected)\n", AP_SSID);
   #else
     WiFi.softAP(AP_SSID);
-    Serial.printf("Broadcasting Wi-Fi: %s\n", AP_SSID);
   #endif
   
   IPAddress apIP(192, 168, 4, 1);
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
-  
-  Serial.println("Portal IP: http://192.168.4.1");
   dnsServer.start(53, "*", apIP);
   
-  server.on("/", HTTP_GET, []() {
-    server.send(200, "text/html", generatePortalHtml());
-  });
-  
+  server.on("/", HTTP_GET, []() { server.send(200, "text/html", generatePortalHtml()); });
   server.on("/save", HTTP_POST, handleSaveConfig);
-  server.on("/generate_204", []() { server.send(200, "text/html", generatePortalHtml()); });
-  server.on("/gen_204", []() { server.send(200, "text/html", generatePortalHtml()); });
-  server.on("/hotspot-detect.html", []() { server.send(200, "text/html", generatePortalHtml()); });
-  server.on("/ncsi.txt", []() { server.send(200, "text/plain", "Microsoft NCSI"); });
   server.onNotFound([]() {
     server.sendHeader("Location", "http://192.168.4.1/", true);
     server.send(302, "text/plain", "");
   });
-  
   server.begin();
-  Serial.println("✅ Captive Portal Server Started.");
 }
 
 // ==========================================
-// 10. SETUP & LOOP
+// 11. SETUP & LOOP
 // ==========================================
 void setup() {
-  // 1. HARDWARE SAFETY FIRST: Lock door pin immediately before any code, serial init, or boot melodies
+  // 1. HARDWARE SAFETY FIRST: Lock relay immediately
   digitalWrite(RELAY_PIN, RELAY_INACTIVE_LEVEL);
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, RELAY_INACTIVE_LEVEL);
 
-  // Configure Other Pins
+  // Configure Pins
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
   pinMode(TOUCH_PIN, INPUT_PULLUP);
@@ -789,27 +981,38 @@ void setup() {
   Serial.begin(9600);
   delay(100);
   Serial.println("\n\n========================================");
-  Serial.println("🏋️ FITNESS BOX - SMART BIOMETRIC SYSTEM (SECURE)");
+  Serial.printf("🏋️ FITNESS BOX - SMART BIOMETRIC GATE (%s)\n", FIRMWARE_VERSION);
   Serial.println("========================================");
 
-  // Prevent ESP-IDF auto-connect from stale internal NVS settings
+  // Dual-Partition OTA Rollback Self-Test
+  const esp_partition_t *runningPartition = esp_ota_get_running_partition();
+  esp_ota_img_states_t otaState;
+  if (esp_ota_get_state_partition(runningPartition, &otaState) == ESP_OK) {
+    if (otaState == ESP_OTA_IMG_PENDING_VERIFY) {
+      Serial.println("🧪 [OTA] Running newly flashed firmware (PENDING VERIFICATION)...");
+    }
+  }
+
+  // Prevent internal NVS WiFi auto-reconnect conflict
   WiFi.persistent(false);
 
-  // Play power-on boot sequence
+  // Load persistent local member cache from flash
+  loadLocalCacheFromFlash();
+
+  // Boot melody
   soundSystemBoot();
 
   // Initialize Fingerprint Sensor
   Serial2.begin(57600, SERIAL_8N1, RX_PIN, TX_PIN);
   finger.begin(57600);
   delay(50);
-
   if (finger.verifyPassword()) {
     Serial.println("✅ Fingerprint Sensor (R307S): Ready!");
   } else {
     Serial.println("❌ ERROR: Could not find Fingerprint sensor.");
   }
 
-  // Load Saved Settings from Flash memory
+  // Load Saved Settings from NVS
   prefs.begin("fitness_box", true);
   storedSSID = prefs.getString("ssid", "");
   storedPassword = prefs.getString("pass", "");
@@ -817,15 +1020,14 @@ void setup() {
   linkedGymId = prefs.getString("gym_id", "");
   prefs.end();
 
-  // If no Wi-Fi credentials saved, enter Setup Portal immediately
   if (storedSSID == "" || storedLinkingKey == "") {
-    Serial.println("ℹ️ No saved Wi-Fi or Linking Key found. Launching Setup Portal...");
+    Serial.println("ℹ️ No saved Wi-Fi found. Starting Setup Portal...");
     startCaptivePortal();
     return;
   }
 
-  // Try connecting to saved Wi-Fi
-  Serial.printf("📶 Connecting to saved Wi-Fi: %s", storedSSID.c_str());
+  // Connect to Wi-Fi
+  Serial.printf("📶 Connecting to Wi-Fi: %s", storedSSID.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(storedSSID.c_str(), storedPassword.c_str());
@@ -841,21 +1043,31 @@ void setup() {
     Serial.println("\n✅ Wi-Fi Connected! IP: " + WiFi.localIP().toString());
     Serial.println("🏢 Linked Gym ID: " + linkedGymId);
     
-    // Synchronize NTP Real-time Clock (for accurate member expiration checks)
+    // Sync NTP Clock
     #ifdef TIMEZONE_OFFSET_SEC
       configTime(TIMEZONE_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
     #else
-      configTime(19800, 0, "pool.ntp.org", "time.google.com"); // UTC+5:30 default
+      configTime(19800, 0, "pool.ntp.org", "time.google.com"); // UTC+5:30 (India)
     #endif
-    Serial.println("⏰ NTP Time synchronization initialized.");
-    
+
+    // OTA Self-Test Verification Check: Cancel rollback if healthy
+    if (otaState == ESP_OTA_IMG_PENDING_VERIFY) {
+      Serial.println("✅ [OTA] New firmware verified! Cancelling rollback...");
+      esp_ota_mark_app_valid_cancel_rollback();
+      reportOtaStatus("SUCCESS", FIRMWARE_VERSION);
+    }
+
     soundCloudOnline();
+
+    // 💡 COST OPTIMIZATION: Initial full member cache sync executed ONLY ONCE on fresh boot!
+    syncActiveMembersCache();
+    checkOtaUpdate();
   } else {
-    Serial.println("\n⚠️ Failed to connect to saved Wi-Fi. Launching Setup Portal fallback...");
-    WiFi.setAutoReconnect(false);
-    WiFi.disconnect(false, false);
-    delay(100);
-    startCaptivePortal();
+    Serial.println("\n⚠️ Failed to connect to Wi-Fi. Operating in OFFLINE CACHE MODE.");
+    if (otaState == ESP_OTA_IMG_PENDING_VERIFY) {
+      Serial.println("❌ [OTA] Self-test failed on new image. Triggering ROLLBACK to previous partition!");
+      esp_ota_mark_app_invalid_rollback_and_reboot();
+    }
   }
 }
 
@@ -863,24 +1075,20 @@ void loop() {
   if (isSetupMode) {
     dnsServer.processNextRequest();
     server.handleClient();
-    
-    // Auto-restart recovery after timeout to retry Wi-Fi in case of transient power/router reset
     if (millis() - setupModeStartedAt > SETUP_PORTAL_TIMEOUT_MS) {
-      Serial.println("🔄 Captive Portal timeout reached. Rebooting to retry saved Wi-Fi...");
       ESP.restart();
     }
     return;
   }
 
-  // Always service non-blocking door lock timer
+  // Non-blocking solenoid relay timer
   updateSolenoidState();
 
-  // 1. Interior Push-to-Exit Button (Debounced edge detection, non-blocking)
+  // 1. Interior Push-to-Exit Button (Debounced)
   static bool lastExitButton = HIGH;
   bool currentExitButton = digitalRead(EXIT_BUTTON_PIN);
-
   if (lastExitButton == HIGH && currentExitButton == LOW) {
-    delay(20); // Debounce
+    delay(20);
     if (digitalRead(EXIT_BUTTON_PIN) == LOW) {
       Serial.println("🚪 [EXIT] Interior Exit Button Pressed!");
       soundExitButton();
@@ -890,16 +1098,24 @@ void loop() {
   }
   lastExitButton = currentExitButton;
 
-  // 2. Member Fingerprint Scan
+  // 2. Member Fingerprint Scan (Cache-first <15ms)
   if (digitalRead(TOUCH_PIN) == LOW) {
     handleFingerprintVerification();
   }
 
-  // 3. Periodically check website for enrollment commands
-  if (millis() - lastEnrollCheck > ENROLL_CHECK_INTERVAL) {
-    lastEnrollCheck = millis();
+  // 3. Command & Sync Polling (Enrollment, Remote Unlock, and Event-Driven Sync Signal)
+  if (millis() - lastCommandCheck > COMMAND_CHECK_INTERVAL) {
+    lastCommandCheck = millis();
     checkEnrollmentRequest();
+    checkRemoteUnlockCommand();
+    checkMemberCacheSyncSignal(); // 💡 ONLY syncs when website actually modified records!
   }
 
-  delay(25);
+  // 4. Infrequent OTA Check (Every 30 mins)
+  if (millis() - lastOtaCheck > OTA_CHECK_INTERVAL) {
+    lastOtaCheck = millis();
+    checkOtaUpdate();
+  }
+
+  delay(20);
 }
