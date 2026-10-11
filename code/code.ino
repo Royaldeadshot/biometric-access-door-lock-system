@@ -15,7 +15,7 @@
 // ==========================================
 // 1. PIN DEFINITIONS & CONSTANTS
 // ==========================================
-#define FIRMWARE_VERSION "v1.2.0"
+#define FIRMWARE_VERSION "v1.2.1"
 
 // Fingerprint Sensor (R307S)
 #define RX_PIN 16         // ESP32 RX2 <- R307S TX (Yellow Wire)
@@ -214,27 +214,60 @@ String extractJsonField(const String &json, const String &fieldName) {
   int colonIdx = json.indexOf(":", fieldIdx);
   if (colonIdx == -1) return "";
 
-  int stringValIdx = json.indexOf("\"stringValue\"", colonIdx);
-  if (stringValIdx != -1 && stringValIdx < colonIdx + 45) {
-    int valColonIdx = json.indexOf(":", stringValIdx);
-    if (valColonIdx != -1) {
-      int firstQuote = json.indexOf("\"", valColonIdx);
-      if (firstQuote != -1) {
-        int endQuote = json.indexOf("\"", firstQuote + 1);
-        if (endQuote != -1) {
-          return json.substring(firstQuote + 1, endQuote);
-        }
+  // 1. Check for Firestore REST "stringValue": "..."
+  int strValIdx = json.indexOf("\"stringValue\"", colonIdx);
+  if (strValIdx != -1 && strValIdx < colonIdx + 45) {
+    int valColon = json.indexOf(":", strValIdx);
+    if (valColon != -1) {
+      int q1 = json.indexOf("\"", valColon);
+      if (q1 != -1) {
+        int q2 = json.indexOf("\"", q1 + 1);
+        if (q2 != -1) return json.substring(q1 + 1, q2);
       }
     }
   }
 
+  // 2. Check for Firestore REST "integerValue": "..." (or unquoted number)
+  int intValIdx = json.indexOf("\"integerValue\"", colonIdx);
+  if (intValIdx != -1 && intValIdx < colonIdx + 45) {
+    int valColon = json.indexOf(":", intValIdx);
+    if (valColon != -1) {
+      int q1 = json.indexOf("\"", valColon);
+      if (q1 != -1 && q1 < valColon + 5) {
+        int q2 = json.indexOf("\"", q1 + 1);
+        if (q2 != -1) return json.substring(q1 + 1, q2);
+      } else {
+        int start = valColon + 1;
+        while (start < json.length() && (json[start] == ' ' || json[start] == '\t')) start++;
+        int end = start;
+        while (end < json.length() && (json[end] >= '0' && json[end] <= '9')) end++;
+        if (end > start) return json.substring(start, end);
+      }
+    }
+  }
+
+  // 3. Check for Firestore REST "booleanValue": true/false
+  int boolValIdx = json.indexOf("\"booleanValue\"", colonIdx);
+  if (boolValIdx != -1 && boolValIdx < colonIdx + 45) {
+    int valColon = json.indexOf(":", boolValIdx);
+    if (valColon != -1) {
+      int start = valColon + 1;
+      while (start < json.length() && (json[start] == ' ' || json[start] == '\t')) start++;
+      if (json.startsWith("true", start)) return "true";
+      if (json.startsWith("false", start)) return "false";
+    }
+  }
+
+  // 4. Standard plain JSON string fallback: "fieldName": "value"
   int firstQuote = json.indexOf("\"", colonIdx);
-  if (firstQuote == -1) return "";
+  if (firstQuote != -1 && firstQuote < colonIdx + 20) {
+    int endQuote = json.indexOf("\"", firstQuote + 1);
+    if (endQuote != -1) {
+      return json.substring(firstQuote + 1, endQuote);
+    }
+  }
 
-  int endQuote = json.indexOf("\"", firstQuote + 1);
-  if (endQuote == -1) return "";
-
-  return json.substring(firstQuote + 1, endQuote);
+  return "";
 }
 
 String getTodayDateString() {
@@ -335,6 +368,13 @@ void syncActiveMembersCache() {
       }
     }
     Serial.printf("✅ [CACHE] Initial boot sync complete (%d member records cached).\n", syncedCount);
+  } else {
+    String errResp = https.getString();
+    Serial.printf("❌ [CACHE SYNC ERROR] Firestore returned HTTP %d: %s\n", httpCode, errResp.c_str());
+    if (httpCode == 403) {
+      Serial.println("🔒 [ACTION NEEDED] Firestore Security Rules in Firebase Console are blocking member reads!");
+      Serial.println("👉 In Firebase Console -> Firestore Database -> Rules, set: match /gyms/{gymId}/members/{memberId} { allow read: if true; }");
+    }
   }
   https.end();
 }
@@ -704,6 +744,17 @@ void runEnrollmentProcess() {
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
+
+  // Check if finger is ALREADY enrolled on this sensor to prevent duplicate slots
+  if (finger.fingerFastSearch() == FINGERPRINT_OK) {
+    uint8_t existingSlot = finger.fingerID;
+    Serial.printf("⚠️ [ALREADY ENROLLED] Finger already registered in Slot #%d! Re-linking.\n", existingSlot);
+    soundEnrollSuccess();
+    triggerLedEnrollSuccess();
+    saveMemberToLocalCache(existingSlot, true, "2099-12-31", "Member");
+    updateEnrollmentStatus("SUCCESS", existingSlot);
+    return;
+  }
   
   soundEnrollStep1();
   delay(1000);
@@ -736,6 +787,8 @@ void runEnrollmentProcess() {
     Serial.printf("🎉 Enrolled into Slot #%d!\n", nextSlot);
     soundEnrollSuccess();
     triggerLedEnrollSuccess();
+    // Pre-cache immediately so member can scan right away!
+    saveMemberToLocalCache(nextSlot, true, "2099-12-31", "New Member");
     updateEnrollmentStatus("SUCCESS", nextSlot);
   } else {
     soundEnrollFailed();
@@ -821,8 +874,22 @@ void handleFingerprintVerification() {
       String queryPayload = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"members\"}],\"where\":{\"fieldFilter\":{\"field\":{\"fieldPath\":\"fingerprint_id\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"" + String(slotId) + "\"}}},\"limit\":1}}";
 
       int httpCode = https.POST(queryPayload);
+      String resp = "";
       if (httpCode == 200) {
-        String resp = https.getString();
+        resp = https.getString();
+        // Fallback: If not found as stringValue, check if stored as integerValue in Firestore
+        if (resp.indexOf("\"document\"") == -1) {
+          https.end();
+          if (https.begin(client, url)) {
+            applyAuthHeader(https);
+            String intQuery = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"members\"}],\"where\":{\"fieldFilter\":{\"field\":{\"fieldPath\":\"fingerprint_id\"},\"op\":\"EQUAL\",\"value\":{\"integerValue\":\"" + String(slotId) + "\"}}},\"limit\":1}}";
+            int intCode = https.POST(intQuery);
+            if (intCode == 200) {
+              resp = https.getString();
+            }
+          }
+        }
+
         if (resp.indexOf("\"document\"") != -1) {
           String name = extractJsonField(resp, "name");
           String status = extractJsonField(resp, "status");
@@ -845,6 +912,15 @@ void handleFingerprintVerification() {
             https.end();
             return;
           }
+        } else {
+          Serial.printf("⚠️ Slot #%d not found in cloud members collection.\n", slotId);
+        }
+      } else {
+        String errResp = https.getString();
+        Serial.printf("❌ [CLOUD VERIFY ERROR] Firestore returned HTTP %d: %s\n", httpCode, errResp.c_str());
+        if (httpCode == 403) {
+          Serial.println("🔒 [ACTION NEEDED] Firestore Security Rules in Firebase Console are blocking member reads!");
+          Serial.println("👉 Update rules in Firebase Console: match /gyms/{gymId}/members/{memberId} { allow read: if true; }");
         }
       }
       https.end();
@@ -1115,6 +1191,23 @@ void loop() {
   if (millis() - lastOtaCheck > OTA_CHECK_INTERVAL) {
     lastOtaCheck = millis();
     checkOtaUpdate();
+  }
+
+  // 5. Serial Commands (Debugging & Sensor Maintenance)
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd == "CLEAR_SENSOR") {
+      finger.emptyDatabase();
+      prefs.begin("fb_cache", false);
+      prefs.clear();
+      prefs.end();
+      for (int i = 0; i <= MAX_SENSOR_CAPACITY; i++) localCache[i].valid = false;
+      Serial.println("🗑️ [RESET] All fingerprint templates on sensor & flash cache wiped clean.");
+    } else if (cmd == "SYNC") {
+      Serial.println("🔄 [MANUAL SYNC] Refreshing local member cache from cloud...");
+      syncActiveMembersCache();
+    }
   }
 
   delay(20);
