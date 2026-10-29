@@ -15,7 +15,7 @@
 // ==========================================
 // 1. PIN DEFINITIONS & CONSTANTS
 // ==========================================
-#define FIRMWARE_VERSION "v1.2.1"
+#define FIRMWARE_VERSION "v1.2.3"
 
 // Fingerprint Sensor (R307S)
 #define RX_PIN 16         // ESP32 RX2 <- R307S TX (Yellow Wire)
@@ -520,11 +520,35 @@ void logAccessEvent(String type, String memberId, String reason) {
   if (!https.begin(client, url)) return;
   
   applyAuthHeader(https);
+
+  // Compute real Unix epoch timestamp (ms) and ISO string via NTP
+  time_t now = time(nullptr);
+  String timestampStr;
+  String isoCreatedAt = "";
+
+  if (now > 1700000000) { // NTP time valid (after Nov 2023)
+    unsigned long long epochMs = ((unsigned long long)now) * 1000ULL;
+    char msBuf[24];
+    snprintf(msBuf, sizeof(msBuf), "%llu", epochMs);
+    timestampStr = String(msBuf);
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 200)) {
+      char isoBuf[32];
+      strftime(isoBuf, sizeof(isoBuf), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+      isoCreatedAt = String(isoBuf);
+    }
+  } else {
+    // If NTP has not yet synchronized, mark 0 (never raw millis)
+    timestampStr = "0";
+  }
+
   String payload = "{\"fields\":{"
     "\"type\":{\"stringValue\":\"" + type + "\"},"
     "\"member_id\":{\"stringValue\":\"" + memberId + "\"},"
     "\"reason\":{\"stringValue\":\"" + reason + "\"},"
-    "\"timestamp\":{\"stringValue\":\"" + String(millis()) + "\"}"
+    "\"timestamp\":{\"stringValue\":\"" + timestampStr + "\"}" +
+    (isoCreatedAt.length() > 0 ? ",\"created_at\":{\"stringValue\":\"" + isoCreatedAt + "\"}" : "") +
   "}}";
   
   https.POST(payload);
@@ -562,6 +586,29 @@ void checkRemoteUnlockCommand() {
         String patchPayload = "{\"fields\":{\"status\":{\"stringValue\":\"COMPLETED\"}}}";
         https.PATCH(patchPayload);
       }
+    } else if (cmd == "PING" && st == "PENDING") {
+      Serial.println("\n📡 [PING] On-demand ping received from Web Dashboard! Replying PONG...");
+      https.end();
+      String patchUrl = url + "?updateMask.fieldPaths=status&updateMask.fieldPaths=pong_timestamp&updateMask.fieldPaths=wifi_rssi";
+      if (https.begin(client, patchUrl)) {
+        applyAuthHeader(https);
+        String payload = "{\"fields\":{"
+          "\"status\":{\"stringValue\":\"PONG\"},"
+          "\"pong_timestamp\":{\"stringValue\":\"" + String(millis()) + "\"},"
+          "\"wifi_rssi\":{\"integerValue\":\"" + String(WiFi.RSSI()) + "\"}"
+        "}}";
+        https.PATCH(payload);
+      }
+    } else if (cmd == "CHECK_OTA" && st == "PENDING") {
+      Serial.println("\n🚀 [OTA] Remote OTA check command received from Cloud!");
+      https.end();
+      String patchUrl = url + "?updateMask.fieldPaths=status";
+      if (https.begin(client, patchUrl)) {
+        applyAuthHeader(https);
+        String patchPayload = "{\"fields\":{\"status\":{\"stringValue\":\"COMPLETED\"}}}";
+        https.PATCH(patchPayload);
+      }
+      checkOtaUpdate();
     }
   }
   https.end();
@@ -641,6 +688,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient https;
+  https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   if (!https.begin(client, binUrl)) {
     Serial.println("❌ [OTA] Could not connect to binary download URL.");
@@ -1207,6 +1255,9 @@ void loop() {
     } else if (cmd == "SYNC") {
       Serial.println("🔄 [MANUAL SYNC] Refreshing local member cache from cloud...");
       syncActiveMembersCache();
+    } else if (cmd == "OTA") {
+      Serial.println("🚀 [MANUAL OTA] Checking for pending cloud firmware updates...");
+      checkOtaUpdate();
     }
   }
 
