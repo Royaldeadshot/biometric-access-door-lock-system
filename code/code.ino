@@ -5,6 +5,7 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <Adafruit_Fingerprint.h>
+#include <Adafruit_NeoPixel.h>
 #include <time.h>
 #include "secrets.h"
 #include <driver/gpio.h>
@@ -34,8 +35,9 @@
 // Interior Push-to-Exit Button
 #define EXIT_BUTTON_PIN 27       // ESP32 GPIO 27 (Pin D27) -> Switch Pin 1. Switch Pin 2 -> GND
 
-// LED Ring (Future)
-#define LED_PIN 18               // WS2812 / SK6812 LED Ring Data (GPIO 18)
+// Addressable SK6812 RGB LED Ring (8 LEDs)
+#define LED_PIN 18               // SK6812 LED Data In (GPIO 18)
+#define NUM_LEDS 8               // 8 Addressable LEDs
 
 // Sensor limits
 const uint8_t MAX_SENSOR_CAPACITY = 127;
@@ -47,6 +49,7 @@ const char* AP_SSID = "FitnessBox-Scanner";
 // OBJECTS & GLOBALS
 // ==========================================
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&Serial2);
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 Preferences prefs;
 WebServer server(80);
 DNSServer dnsServer;
@@ -198,11 +201,188 @@ void updateSolenoidState() {
   }
 }
 
-void triggerLedAccessGranted()        { Serial.println("💡 [LED RING] Green pulse"); }
-void triggerLedAccessDeniedExpired()  { Serial.println("💡 [LED RING] Rapid red pulse"); }
-void triggerLedAccessDeniedUnknown()  { Serial.println("💡 [LED RING] Amber steady"); }
-void triggerLedEnrollScanning()       { Serial.println("💡 [LED RING] Yellow rotating"); }
-void triggerLedEnrollSuccess()        { Serial.println("💡 [LED RING] Purple completion"); }
+// ==========================================
+// 3. ADDRESSABLE RGB LED SUITE (8x SK6812 MINI-E)
+// ==========================================
+void setAllLeds(uint8_t r, uint8_t g, uint8_t b) {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, strip.Color(r, g, b));
+  }
+  strip.show();
+}
+
+void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
+  setAllLeds(r, g, b);
+}
+
+// Convert 0-255 wheel position into smooth RGB rainbow color
+uint32_t colorWheel(byte wheelPos) {
+  wheelPos = 255 - wheelPos;
+  if (wheelPos < 85) {
+    return strip.Color(255 - wheelPos * 3, 0, wheelPos * 3);
+  }
+  if (wheelPos < 170) {
+    wheelPos -= 85;
+    return strip.Color(0, wheelPos * 3, 255 - wheelPos * 3);
+  }
+  wheelPos -= 170;
+  return strip.Color(wheelPos * 3, 255 - wheelPos * 3, 0);
+}
+
+// Visual Diagnostic & Hardware Showcase Test (Runs on Boot)
+void runLedStartupTest() {
+  Serial.println("\n✨ ========================================");
+  Serial.println("✨ [LED TEST] Starting 8-LED Diagnostic & Visual Showcase...");
+  Serial.println("✨ ========================================");
+
+  strip.begin();
+  strip.setBrightness(120); // 0-255 (Clean, bright, safe current)
+  strip.clear();
+  strip.show();
+
+  // Test 1: Single LED sequential chase (Tests LED 0 to 7 individually)
+  Serial.println("🧪 Phase 1: Individual Pixel Inspection (LED 1 to 8)...");
+  for (int i = 0; i < NUM_LEDS; i++) {
+    Serial.printf("   👉 Lighting LED #%d\n", i + 1);
+    strip.clear();
+    strip.setPixelColor(i, strip.Color(0, 220, 255)); // Bright Cyan
+    strip.show();
+    delay(130);
+  }
+  strip.clear();
+  strip.show();
+  delay(120);
+
+  // Test 2: Color Spectrum Wipes across all 8 LEDs
+  Serial.println("🧪 Phase 2: Color Spectrum Wipes (Red -> Green -> Blue -> Amber -> Purple -> White)...");
+  uint32_t testColors[] = {
+    strip.Color(255, 0, 0),     // Red
+    strip.Color(0, 255, 0),     // Green
+    strip.Color(0, 80, 255),    // Blue
+    strip.Color(255, 140, 0),   // Amber
+    strip.Color(180, 0, 255),   // Purple
+    strip.Color(255, 255, 255)  // Cool White
+  };
+
+  for (int c = 0; c < 6; c++) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      strip.setPixelColor(i, testColors[c]);
+      strip.show();
+      delay(30);
+    }
+    delay(140);
+  }
+
+  // Test 3: Cyberpunk / Knight Rider Larson Scanner (Bouncing Comet back & forth)
+  Serial.println("🧪 Phase 3: Knight Rider Cyberpunk Scanner Bounce...");
+  for (int cycle = 0; cycle < 3; cycle++) {
+    // Forward bounce
+    for (int i = 0; i < NUM_LEDS; i++) {
+      strip.clear();
+      if (i > 0) strip.setPixelColor(i - 1, strip.Color(35, 0, 0)); // Tail
+      strip.setPixelColor(i, strip.Color(255, 15, 15));             // Head
+      if (i < NUM_LEDS - 1) strip.setPixelColor(i + 1, strip.Color(35, 0, 0));
+      strip.show();
+      delay(40);
+    }
+    // Backward bounce
+    for (int i = NUM_LEDS - 1; i >= 0; i--) {
+      strip.clear();
+      if (i < NUM_LEDS - 1) strip.setPixelColor(i + 1, strip.Color(35, 0, 0));
+      strip.setPixelColor(i, strip.Color(255, 15, 15));
+      if (i > 0) strip.setPixelColor(i - 1, strip.Color(35, 0, 0));
+      strip.show();
+      delay(40);
+    }
+  }
+
+  // Test 4: Smooth Rotating Rainbow Wheel (2 full revolutions)
+  Serial.println("🧪 Phase 4: Rotating 360° Rainbow Wheel...");
+  for (int j = 0; j < 256 * 2; j += 4) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      strip.setPixelColor(i, colorWheel(((i * 256 / NUM_LEDS) + j) & 255));
+    }
+    strip.show();
+    delay(10);
+  }
+
+  // Test 5: Soft fade-in to Standby Cyan/Blue Aura
+  Serial.println("✅ [LED TEST] All 8 LEDs verified operational! Standby Aura armed.\n");
+  for (int b = 10; b <= 60; b += 5) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      strip.setPixelColor(i, strip.Color(0, b / 2, b));
+    }
+    strip.show();
+    delay(20);
+  }
+}
+
+void triggerLedAccessGranted() {
+  Serial.println("💡 [LED] Emerald Green Cascade (Access Granted)");
+  for (int pulse = 0; pulse < 2; pulse++) {
+    setAllLeds(0, 255, 50);
+    delay(80);
+    setAllLeds(0, 40, 15);
+    delay(60);
+  }
+  // Fast circular spin
+  for (int rot = 0; rot < NUM_LEDS * 2; rot++) {
+    strip.clear();
+    for (int i = 0; i < 3; i++) {
+      strip.setPixelColor((rot + i) % NUM_LEDS, strip.Color(0, 255, 60));
+    }
+    strip.show();
+    delay(25);
+  }
+  setAllLeds(0, 200, 40);
+}
+
+void triggerLedAccessDeniedExpired() {
+  Serial.println("💡 [LED] Triple Red Strobe (Expired / Inactive)");
+  for (int i = 0; i < 3; i++) {
+    setAllLeds(255, 0, 0);
+    delay(90);
+    setAllLeds(0, 0, 0);
+    delay(70);
+  }
+}
+
+void triggerLedAccessDeniedUnknown() {
+  Serial.println("💡 [LED] Double Amber Strobe (Unknown Finger)");
+  for (int i = 0; i < 2; i++) {
+    setAllLeds(255, 120, 0);
+    delay(110);
+    setAllLeds(0, 0, 0);
+    delay(80);
+  }
+}
+
+void triggerLedEnrollScanning() {
+  Serial.println("💡 [LED] Cyan Scanning Spinner");
+  for (int i = 0; i < NUM_LEDS; i++) {
+    strip.clear();
+    strip.setPixelColor(i, strip.Color(0, 200, 255));
+    strip.setPixelColor((i + 1) % NUM_LEDS, strip.Color(0, 100, 255));
+    strip.show();
+    delay(50);
+  }
+}
+
+void triggerLedEnrollSuccess() {
+  Serial.println("💡 [LED] Violet & Green Rainbow Burst (Enroll Success)");
+  for (int j = 0; j < 256; j += 16) {
+    for (int i = 0; i < NUM_LEDS; i++) {
+      strip.setPixelColor(i, colorWheel(j + (i * 32)));
+    }
+    strip.show();
+    delay(10);
+  }
+  setAllLeds(0, 255, 80);
+}
+
+void triggerLedOff() {
+  setAllLeds(0, 0, 0);
+}
 
 // ==========================================
 // 4. SECURE JSON & TIME HELPERS
@@ -1108,6 +1288,9 @@ void setup() {
   Serial.printf("🏋️ FITNESS BOX - SMART BIOMETRIC GATE (%s)\n", FIRMWARE_VERSION);
   Serial.println("========================================");
 
+  // --- 8-LED Hardware Diagnostic & Showcase Sequence ---
+  runLedStartupTest();
+
   // Dual-Partition OTA Rollback Self-Test
   const esp_partition_t *runningPartition = esp_ota_get_running_partition();
   esp_ota_img_states_t otaState;
@@ -1259,6 +1442,26 @@ void loop() {
       Serial.println("🚀 [MANUAL OTA] Checking for pending cloud firmware updates...");
       checkOtaUpdate();
     }
+  }
+
+  // Standby Ambient LED Animation (Non-blocking Smooth Aura across 8 LEDs)
+  static unsigned long lastLedFrame = 0;
+  static uint8_t ledFrameStep = 0;
+  if (!isSolenoidUnlocked && millis() - lastLedFrame > 40) {
+    lastLedFrame = millis();
+    ledFrameStep++;
+    for (int i = 0; i < NUM_LEDS; i++) {
+      uint8_t angle = (ledFrameStep * 3 + (i * 256 / NUM_LEDS)) & 255;
+      uint8_t intensity = (angle < 128) ? (angle * 2) : ((255 - angle) * 2);
+      uint8_t r = 0;
+      uint8_t g = map(intensity, 0, 255, 6, 50);
+      uint8_t b = map(intensity, 0, 255, 20, 110);
+      strip.setPixelColor(i, strip.Color(r, g, b));
+    }
+    strip.show();
+  } else if (isSolenoidUnlocked) {
+    // Solid Emerald Green glow while door is actively unlocked
+    setAllLeds(0, 200, 40);
   }
 
   delay(20);
