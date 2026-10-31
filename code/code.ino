@@ -16,7 +16,7 @@
 // ==========================================
 // 1. PIN DEFINITIONS & CONSTANTS
 // ==========================================
-#define FIRMWARE_VERSION "v1.2.4"
+#define FIRMWARE_VERSION "v1.2.5"
 
 // Fingerprint Sensor (R307S)
 #define RX_PIN 16         // ESP32 RX2 <- R307S TX (Yellow Wire)
@@ -120,8 +120,7 @@ void triggerLedEnrollPurple();
 void triggerLedEnrollSuccess();
 void triggerLedOff();
 void triggerLedIdle();
-void ledWorkerTask(void *pvParameters);
-TaskHandle_t ledTaskHandle = NULL;
+void updateLedSystem();
 void updateSolenoidState();
 String extractJsonField(const String &json, const String &fieldName);
 String getTodayDateString();
@@ -271,20 +270,24 @@ uint32_t colorWheel(byte wheelPos, uint8_t brightness = 255) {
 }
 
 volatile LedState currentLedState = LED_STATE_IDLE;
+unsigned long ledStateStartedAt = 0;
 
 void triggerLedAccessGranted() {
   Serial.println("💡 [LED] Solid Green Triple Pulse (Access Granted)");
   currentLedState = LED_STATE_GRANTED;
+  ledStateStartedAt = millis();
 }
 
 void triggerLedAccessDeniedExpired() {
   Serial.println("💡 [LED] Rapid Red Pulse (Expired Membership)");
   currentLedState = LED_STATE_DENIED_EXPIRED;
+  ledStateStartedAt = millis();
 }
 
 void triggerLedAccessDeniedUnknown() {
   Serial.println("💡 [LED] Steady Orange/Amber (Unknown Finger)");
   currentLedState = LED_STATE_DENIED_UNKNOWN;
+  ledStateStartedAt = millis();
 }
 
 void triggerLedEnrollYellow() {
@@ -298,6 +301,7 @@ void triggerLedEnrollPurple() {
 void triggerLedEnrollSuccess() {
   Serial.println("💡 [LED] Purple Completion Pulse (Enroll Success)");
   currentLedState = LED_STATE_ENROLL_SUCCESS;
+  ledStateStartedAt = millis();
 }
 
 void triggerLedOff() {
@@ -343,129 +347,144 @@ const AuraPalette AURA_THEMES[] = {
 const uint8_t NUM_AURA_THEMES = 4;
 
 // ==========================================
-// DEDICATED FREERTOS LED ENGINE (CORE 0)
-// Runs continuously without stopping, 100% immune to HTTPS / Wi-Fi blocking!
+// HIGH-PERFORMANCE NON-BLOCKING LED SYSTEM
+// Runs on Core 1 at smooth 40 FPS with ZERO cross-core RMT collisions
 // ==========================================
-void ledWorkerTask(void *pvParameters) {
-  uint16_t subPos1 = 0;
-  uint16_t subPos2 = 0;
-  uint8_t breathAngle = 0;
-  uint8_t spinnerIdx = 0;
-
-  while (true) {
-    // 1. If door is currently unlocked, hold solid emerald green
-    if (isSolenoidUnlocked) {
-      setAllLeds(0, 255, 0);
-      vTaskDelay(pdMS_TO_TICKS(25));
-      continue;
-    }
-
-    // 2. State-driven animations
-    if (currentLedState == LED_STATE_GRANTED) {
-      // Solid Green triple pulse
-      for (int pulse = 0; pulse < 3; pulse++) {
-        setAllLeds(0, 255, 0);
-        vTaskDelay(pdMS_TO_TICKS(110));
-        setAllLeds(0, 0, 0);
-        if (pulse < 2) vTaskDelay(pdMS_TO_TICKS(90));
-      }
-      setAllLeds(0, 255, 0);
-      currentLedState = LED_STATE_IDLE;
-      continue;
-    }
-
-    if (currentLedState == LED_STATE_DENIED_EXPIRED) {
-      // Rapid Red 4-pulse
-      for (int i = 0; i < 4; i++) {
-        setAllLeds(255, 0, 0);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        setAllLeds(0, 0, 0);
-        vTaskDelay(pdMS_TO_TICKS(90));
-      }
-      currentLedState = LED_STATE_IDLE;
-      continue;
-    }
-
-    if (currentLedState == LED_STATE_DENIED_UNKNOWN) {
-      // Solid steady Amber for 1.2s
-      setAllLeds(255, 100, 0);
-      vTaskDelay(pdMS_TO_TICKS(1200));
-      currentLedState = LED_STATE_IDLE;
-      continue;
-    }
-
-    if (currentLedState == LED_STATE_ENROLL_YELLOW) {
-      showEnrollSpinner(spinnerIdx++, 255, 180, 0);
-      vTaskDelay(pdMS_TO_TICKS(60));
-      continue;
-    }
-
-    if (currentLedState == LED_STATE_ENROLL_PURPLE) {
-      showEnrollSpinner(spinnerIdx++, 180, 0, 255);
-      vTaskDelay(pdMS_TO_TICKS(50));
-      continue;
-    }
-
-    if (currentLedState == LED_STATE_ENROLL_SUCCESS) {
-      for (int i = 0; i < 3; i++) {
-        setAllLeds(180, 0, 255);
-        vTaskDelay(pdMS_TO_TICKS(120));
-        setAllLeds(0, 0, 0);
-        if (i < 2) vTaskDelay(pdMS_TO_TICKS(80));
-      }
-      currentLedState = LED_STATE_IDLE;
-      continue;
-    }
-
-    if (currentLedState == LED_STATE_OFF) {
-      setAllLeds(0, 0, 0);
-      vTaskDelay(pdMS_TO_TICKS(50));
-      continue;
-    }
-
-    // 3. CONTINUOUS DUAL-ORBIT PLASMA AURA (40 FPS, ZERO FREEZES)
-    subPos1 = (subPos1 + 420) % (256 * 256);
-    subPos2 = (subPos2 + (256 * 256) - 290) % (256 * 256);
-
-    uint8_t pos1 = subPos1 >> 8;
-    uint8_t pos2 = subPos2 >> 8;
-
-    breathAngle += 3;
-    uint8_t bTriangle = (breathAngle < 128) ? breathAngle : (255 - breathAngle);
-    uint8_t breathVal = 10 + (bTriangle * 28 / 128);
-
-    uint8_t currentTheme = (millis() / 12000) % NUM_AURA_THEMES;
-    const AuraPalette &pal = AURA_THEMES[currentTheme];
-
-    for (int i = 0; i < NUM_LEDS; i++) {
-      int ledAngle = i * 32;
-
-      int d1 = abs((int)pos1 - ledAngle);
-      if (d1 > 128) d1 = 256 - d1;
-      uint8_t w1 = (d1 < 44) ? ((44 - d1) * 255 / 44) : 0;
-
-      int d2 = abs((int)pos2 - ledAngle);
-      if (d2 > 128) d2 = 256 - d2;
-      uint8_t w2 = (d2 < 44) ? ((44 - d2) * 255 / 44) : 0;
-
-      uint8_t coreBoost1 = (d1 < 10) ? ((10 - d1) * 60 / 10) : 0;
-      uint8_t coreBoost2 = (d2 < 10) ? ((10 - d2) * 40 / 10) : 0;
-
-      int r = ((int)pal.baseR * breathVal) / 255 + ((int)pal.c1R * w1) / 255 + ((int)pal.c2R * w2) / 255 + coreBoost1 + coreBoost2;
-      int g = ((int)pal.baseG * breathVal) / 255 + ((int)pal.c1G * w1) / 255 + ((int)pal.c2G * w2) / 255 + coreBoost1 + coreBoost2;
-      int b = ((int)pal.baseB * breathVal) / 255 + ((int)pal.c1B * w1) / 255 + ((int)pal.c2B * w2) / 255 + coreBoost1 + coreBoost2;
-
-      strip.setPixelColor(i, strip.Color(
-        r > 255 ? 255 : r,
-        g > 255 ? 255 : g,
-        b > 255 ? 255 : b
-      ));
-    }
-    strip.show();
-
-    // Rock-solid 40 FPS
-    vTaskDelay(pdMS_TO_TICKS(25));
+void updateLedSystem() {
+  // 1. If door is currently unlocked, hold solid emerald green
+  if (isSolenoidUnlocked) {
+    setAllLeds(0, 255, 0);
+    return;
   }
+
+  // 2. State-driven animations (Non-blocking timing)
+  if (currentLedState == LED_STATE_GRANTED) {
+    unsigned long elapsed = millis() - ledStateStartedAt;
+    if (elapsed < 600) {
+      unsigned long cycle = elapsed % 200;
+      if (cycle < 110) {
+        setAllLeds(0, 255, 0);
+      } else {
+        setAllLeds(0, 0, 0);
+      }
+      return;
+    } else {
+      currentLedState = LED_STATE_IDLE;
+    }
+  }
+
+  if (currentLedState == LED_STATE_DENIED_EXPIRED) {
+    unsigned long elapsed = millis() - ledStateStartedAt;
+    if (elapsed < 760) {
+      unsigned long cycle = elapsed % 190;
+      if (cycle < 100) {
+        setAllLeds(255, 0, 0);
+      } else {
+        setAllLeds(0, 0, 0);
+      }
+      return;
+    } else {
+      currentLedState = LED_STATE_IDLE;
+    }
+  }
+
+  if (currentLedState == LED_STATE_DENIED_UNKNOWN) {
+    unsigned long elapsed = millis() - ledStateStartedAt;
+    if (elapsed < 1200) {
+      setAllLeds(255, 100, 0);
+      return;
+    } else {
+      currentLedState = LED_STATE_IDLE;
+    }
+  }
+
+  if (currentLedState == LED_STATE_ENROLL_YELLOW) {
+    static unsigned long lastYellowSpin = 0;
+    static uint8_t yellowSpinIdx = 0;
+    if (millis() - lastYellowSpin >= 60) {
+      lastYellowSpin = millis();
+      showEnrollSpinner(yellowSpinIdx++, 255, 180, 0);
+    }
+    return;
+  }
+
+  if (currentLedState == LED_STATE_ENROLL_PURPLE) {
+    static unsigned long lastPurpleSpin = 0;
+    static uint8_t purpleSpinIdx = 0;
+    if (millis() - lastPurpleSpin >= 50) {
+      lastPurpleSpin = millis();
+      showEnrollSpinner(purpleSpinIdx++, 180, 0, 255);
+    }
+    return;
+  }
+
+  if (currentLedState == LED_STATE_ENROLL_SUCCESS) {
+    unsigned long elapsed = millis() - ledStateStartedAt;
+    if (elapsed < 600) {
+      unsigned long cycle = elapsed % 200;
+      if (cycle < 120) {
+        setAllLeds(180, 0, 255);
+      } else {
+        setAllLeds(0, 0, 0);
+      }
+      return;
+    } else {
+      currentLedState = LED_STATE_IDLE;
+    }
+  }
+
+  if (currentLedState == LED_STATE_OFF) {
+    setAllLeds(0, 0, 0);
+    return;
+  }
+
+  // 3. CONTINUOUS DUAL-ORBIT PLASMA AURA (40 FPS, ZERO FREEZES)
+  static unsigned long lastAuraFrame = 0;
+  if (millis() - lastAuraFrame < 25) return; // 40 FPS throttle
+  lastAuraFrame = millis();
+
+  static uint16_t subPos1 = 0;
+  static uint16_t subPos2 = 0;
+  static uint8_t breathAngle = 0;
+
+  subPos1 = (subPos1 + 420) % (256 * 256);
+  subPos2 = (subPos2 + (256 * 256) - 290) % (256 * 256);
+
+  uint8_t pos1 = subPos1 >> 8;
+  uint8_t pos2 = subPos2 >> 8;
+
+  breathAngle += 3;
+  uint8_t bTriangle = (breathAngle < 128) ? breathAngle : (255 - breathAngle);
+  uint8_t breathVal = 10 + (bTriangle * 28 / 128);
+
+  uint8_t currentTheme = (millis() / 12000) % NUM_AURA_THEMES;
+  const AuraPalette &pal = AURA_THEMES[currentTheme];
+
+  for (int i = 0; i < NUM_LEDS; i++) {
+    int ledAngle = i * 32;
+
+    int d1 = abs((int)pos1 - ledAngle);
+    if (d1 > 128) d1 = 256 - d1;
+    uint8_t w1 = (d1 < 44) ? ((44 - d1) * 255 / 44) : 0;
+
+    int d2 = abs((int)pos2 - ledAngle);
+    if (d2 > 128) d2 = 256 - d2;
+    uint8_t w2 = (d2 < 44) ? ((44 - d2) * 255 / 44) : 0;
+
+    uint8_t coreBoost1 = (d1 < 10) ? ((10 - d1) * 60 / 10) : 0;
+    uint8_t coreBoost2 = (d2 < 10) ? ((10 - d2) * 40 / 10) : 0;
+
+    int r = ((int)pal.baseR * breathVal) / 255 + ((int)pal.c1R * w1) / 255 + ((int)pal.c2R * w2) / 255 + coreBoost1 + coreBoost2;
+    int g = ((int)pal.baseG * breathVal) / 255 + ((int)pal.c1G * w1) / 255 + ((int)pal.c2G * w2) / 255 + coreBoost1 + coreBoost2;
+    int b = ((int)pal.baseB * breathVal) / 255 + ((int)pal.c1B * w1) / 255 + ((int)pal.c2B * w2) / 255 + coreBoost1 + coreBoost2;
+
+    strip.setPixelColor(i, strip.Color(
+      r > 255 ? 255 : r,
+      g > 255 ? 255 : g,
+      b > 255 ? 255 : b
+    ));
+  }
+  strip.show();
 }
 
 // Visual Diagnostic & Hardware Showcase Test (Runs on Boot)
@@ -947,13 +966,23 @@ WiFiClientSecure rtdbStreamClient;
 bool isRtdbStreamActive = false;
 unsigned long lastRtdbConnectAttempt = 0;
 
+String getCleanRtdbHost() {
+  String h = String(FIREBASE_RTDB_HOST);
+  h.trim();
+  if (h.startsWith("https://")) h = h.substring(8);
+  if (h.startsWith("http://"))  h = h.substring(7);
+  while (h.endsWith("/")) h = h.substring(0, h.length() - 1);
+  return h;
+}
+
 void sendRtdbPut(const String &subPath, const String &jsonPayload) {
   if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
 
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient https;
-  String url = "https://" + String(FIREBASE_RTDB_HOST) + "/gyms/" + linkedGymId + "/live/" + subPath + ".json";
+  String host = getCleanRtdbHost();
+  String url = "https://" + host + "/gyms/" + linkedGymId + "/live/" + subPath + ".json";
   String token = getFirebaseAuthToken();
   if (token.length() > 0) {
     url += "?auth=" + token;
@@ -1043,6 +1072,8 @@ void handleRtdbEvent(const String &path, const String &dataJson) {
 void processRtdbStream() {
   if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
 
+  String host = getCleanRtdbHost();
+
   // Reconnection logic
   if (!rtdbStreamClient.connected()) {
     if (isRtdbStreamActive) {
@@ -1051,11 +1082,11 @@ void processRtdbStream() {
     }
     if (millis() - lastRtdbConnectAttempt > 5000) {
       lastRtdbConnectAttempt = millis();
-      Serial.println("🌐 [RTDB] Connecting to Firebase Realtime Database SSE Stream...");
+      Serial.printf("🌐 [RTDB] Connecting to Firebase Realtime Database SSE Stream (%s)...\n", host.c_str());
       rtdbStreamClient.stop();
       rtdbStreamClient.setInsecure();
       rtdbStreamClient.setTimeout(4000);
-      if (rtdbStreamClient.connect(FIREBASE_RTDB_HOST, 443)) {
+      if (rtdbStreamClient.connect(host.c_str(), 443)) {
         String path = "/gyms/" + linkedGymId + "/live.json";
         String token = getFirebaseAuthToken();
         if (token.length() > 0) {
@@ -1063,12 +1094,36 @@ void processRtdbStream() {
         }
         rtdbStreamClient.print(
           String("GET ") + path + " HTTP/1.1\r\n" +
-          "Host: " + FIREBASE_RTDB_HOST + "\r\n" +
+          "Host: " + host + "\r\n" +
           "Accept: text/event-stream\r\n" +
           "Connection: keep-alive\r\n\r\n"
         );
-        isRtdbStreamActive = true;
-        Serial.println("⚡ [RTDB] Connected! Push-driven Realtime Stream is ACTIVE (0 Firestore reads).");
+        
+        // Handshake verification
+        unsigned long waitResp = millis();
+        bool streamOk = false;
+        while (millis() - waitResp < 3500) {
+          if (rtdbStreamClient.available()) {
+            String headerLine = rtdbStreamClient.readStringUntil('\n');
+            headerLine.trim();
+            if (headerLine.indexOf("200 OK") != -1 || headerLine.indexOf("200") != -1) {
+              streamOk = true;
+            }
+            if (headerLine.length() == 0 && streamOk) {
+              break;
+            }
+          }
+          delay(10);
+        }
+
+        if (streamOk) {
+          isRtdbStreamActive = true;
+          Serial.println("⚡ [RTDB] Connected & Verified! Push-driven Realtime Stream is ACTIVE (0 Firestore reads).");
+        } else {
+          Serial.println("❌ [RTDB] HTTP Handshake failed or not 200 OK. Falling back to periodic check.");
+          rtdbStreamClient.stop();
+          isRtdbStreamActive = false;
+        }
       } else {
         Serial.println("⚠️ [RTDB] Connection to RTDB failed. Retrying in 5s...");
       }
@@ -1233,13 +1288,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   Serial.printf("\n🚀 [OTA] Starting Over-The-Air firmware flash: %s\n", targetVersion.c_str());
   reportOtaStatus("DOWNLOADING", FIRMWARE_VERSION);
 
-  // 🛑 SUSPEND BACKGROUND LED ENGINE BEFORE FLASHING SPI FLASH MEMORY!
-  // Writing to Flash disables CPU instruction cache. Running FreeRTOS tasks
-  // that output NeoPixel RMT waveforms from Core 0 during flash write causes
-  // cache bus contention and halts LED updates mid-frame!
-  if (ledTaskHandle != NULL) {
-    vTaskSuspend(ledTaskHandle);
-  }
+
   setAllLeds(255, 90, 0); // Solid Amber: OTA Update in progress
 
   WiFiClientSecure client;
@@ -1250,7 +1299,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   if (!https.begin(client, binUrl)) {
     Serial.println("❌ [OTA] Could not connect to binary download URL.");
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
-    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
+    
     return;
   }
 
@@ -1258,7 +1307,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   if (httpCode != 200) {
     Serial.printf("❌ [OTA] HTTP error fetching binary: %d\n", httpCode);
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
-    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
+    
     https.end();
     return;
   }
@@ -1267,7 +1316,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   if (contentLength <= 0) {
     Serial.println("❌ [OTA] Invalid content length.");
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
-    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
+    
     https.end();
     return;
   }
@@ -1276,7 +1325,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   if (!canBegin) {
     Serial.println("❌ [OTA] Not enough space on OTA partition.");
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
-    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
+    
     https.end();
     return;
   }
@@ -1295,7 +1344,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   } else {
     Serial.printf("❌ [OTA] Flash write failed! Written: %d / %d. Error #: %d\n", written, contentLength, Update.getError());
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
-    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
+    
   }
   https.end();
 }
@@ -1373,7 +1422,8 @@ void runEnrollmentProcess() {
   triggerLedEnrollYellow();
   while (p != FINGERPRINT_OK && millis() < timeout) {
     p = finger.getImage();
-    delay(50);
+    updateLedSystem();
+    delay(20);
   }
   if (p != FINGERPRINT_OK || finger.image2Tz(1) != FINGERPRINT_OK) {
     soundEnrollFailed();
@@ -1402,7 +1452,8 @@ void runEnrollmentProcess() {
   p = 0;
   while (p != FINGERPRINT_NOFINGER) {
     p = finger.getImage();
-    delay(50);
+    updateLedSystem();
+    delay(20);
   }
 
   // Touch 2: Yellow rotating spinner while waiting for 2nd touch
@@ -1445,9 +1496,13 @@ void runEnrollmentProcess() {
 // ==========================================
 // 9. HIGH-SPEED MEMBER VERIFICATION (CACHE-FIRST)
 // ==========================================
+static unsigned long fingerCooldownUntil = 0;
+
 void handleFingerprintVerification() {
+  if (millis() < fingerCooldownUntil) return;
+
   Serial.println("\n👆 Finger detected. Reading...");
-  delay(200);
+  delay(60);
   
   uint8_t p = FINGERPRINT_NOFINGER;
   for (int tries = 0; tries < 4; tries++) {
@@ -1459,7 +1514,7 @@ void handleFingerprintVerification() {
   if (p != FINGERPRINT_OK || finger.image2Tz() != FINGERPRINT_OK) {
     soundAccessDeniedUnknown();
     triggerLedAccessDeniedUnknown(); // Steady amber LED + buzzer beep
-    delay(1000);
+    fingerCooldownUntil = millis() + 1500;
     return;
   }
 
@@ -1468,7 +1523,7 @@ void handleFingerprintVerification() {
     soundAccessDeniedUnknown();
     triggerLedAccessDeniedUnknown(); // Steady amber LED + buzzer beep
     logAccessEvent("DENIED", "UNKNOWN", "Not recognized");
-    delay(1200);
+    fingerCooldownUntil = millis() + 1500;
     return;
   }
 
@@ -1491,7 +1546,7 @@ void handleFingerprintVerification() {
       soundAccessDeniedExpired();        // 3 rapid short beeps
       triggerLedAccessDeniedExpired();   // Rapid red pulse
       logAccessEvent("DENIED", String(slotId), "Membership inactive");
-      delay(400);
+      fingerCooldownUntil = millis() + 1500;
       return;
     }
 
@@ -1501,7 +1556,7 @@ void handleFingerprintVerification() {
       soundAccessDeniedExpired();        // 3 rapid short beeps
       triggerLedAccessDeniedExpired();   // Rapid red pulse
       logAccessEvent("DENIED", String(slotId), "Membership expired");
-      delay(400);
+      fingerCooldownUntil = millis() + 1500;
       return;
     }
 
@@ -1511,6 +1566,7 @@ void handleFingerprintVerification() {
     triggerLedAccessGranted();         // Blinks solid green (triple pulse) & holds green
     triggerSolenoid(3);                // Solenoid activates for 3 seconds
     logAccessEvent("GRANTED", String(slotId), "Active membership (Local)");
+    fingerCooldownUntil = millis() + 3000;
     return;
   }
 
@@ -1587,7 +1643,7 @@ void handleFingerprintVerification() {
   soundAccessDeniedUnknown();
   triggerLedAccessDeniedUnknown();
   logAccessEvent("DENIED", String(slotId), "Unverified");
-  delay(1200);
+  fingerCooldownUntil = millis() + 1500;
 }
 
 // ==========================================
@@ -1722,18 +1778,7 @@ void setup() {
   // --- 8-LED Hardware Diagnostic & Showcase Sequence ---
   runLedStartupTest();
 
-  // 🚀 SPAWN UNSTOPPABLE BACKGROUND LED ENGINE ON CORE 0
-  // Completely isolates LED rendering from Wi-Fi / HTTPS network latency!
-  xTaskCreatePinnedToCore(
-    ledWorkerTask,
-    "LED_Aura_Engine",
-    4096,
-    NULL,
-    1,
-    &ledTaskHandle,
-    0
-  );
-  Serial.println("✨ [CORE 0] Background LED Aura Engine active (40 FPS Continuous).");
+
 
   // Dual-Partition OTA Rollback Self-Test
   const esp_partition_t *runningPartition = esp_ota_get_running_partition();
@@ -1869,13 +1914,16 @@ void loop() {
     else if (pollStep == 2) checkMemberCacheSyncSignal();
   }
 
-  // 4. Infrequent OTA Check (Every 30 mins)
+  // 4. Smooth 40 FPS Continuous LED Aura & Feedback Engine (Core 1)
+  updateLedSystem();
+
+  // 5. Infrequent OTA Check (Every 30 mins)
   if (millis() - lastOtaCheck > OTA_CHECK_INTERVAL) {
     lastOtaCheck = millis();
     checkOtaUpdate();
   }
 
-  // 5. Serial Commands (Debugging & Sensor Maintenance)
+  // 6. Serial Commands (Debugging & Sensor Maintenance)
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
@@ -1895,5 +1943,5 @@ void loop() {
     }
   }
 
-  delay(10);
+  delay(1);
 }
