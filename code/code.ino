@@ -16,7 +16,7 @@
 // ==========================================
 // 1. PIN DEFINITIONS & CONSTANTS
 // ==========================================
-#define FIRMWARE_VERSION "v1.2.3"
+#define FIRMWARE_VERSION "v1.2.4"
 
 // Fingerprint Sensor (R307S)
 #define RX_PIN 16         // ESP32 RX2 <- R307S TX (Yellow Wire)
@@ -101,11 +101,37 @@ void soundEnrollSuccess();
 void soundEnrollFailed();
 void soundConfigMode();
 void triggerSolenoid(int durationSeconds);
+enum LedState {
+  LED_STATE_IDLE = 0,
+  LED_STATE_GRANTED,
+  LED_STATE_DENIED_EXPIRED,
+  LED_STATE_DENIED_UNKNOWN,
+  LED_STATE_ENROLL_YELLOW,
+  LED_STATE_ENROLL_PURPLE,
+  LED_STATE_ENROLL_SUCCESS,
+  LED_STATE_OFF
+};
+
+void triggerLedAccessGranted();
+void triggerLedAccessDeniedExpired();
+void triggerLedAccessDeniedUnknown();
+void triggerLedEnrollYellow();
+void triggerLedEnrollPurple();
+void triggerLedEnrollSuccess();
+void triggerLedOff();
+void triggerLedIdle();
+void ledWorkerTask(void *pvParameters);
+TaskHandle_t ledTaskHandle = NULL;
 void updateSolenoidState();
 String extractJsonField(const String &json, const String &fieldName);
 String getTodayDateString();
 void logAccessEvent(String type, String memberId, String reason);
 void applyAuthHeader(HTTPClient &https);
+void runEnrollmentProcess();
+void syncActiveMembersCache();
+void checkOtaUpdate();
+void sendRtdbPut(const String &subPath, const String &jsonPayload);
+void processRtdbStream();
 
 // ==========================================
 // 2. AESTHETIC ACTIVE BUZZER AUDIO SUITE
@@ -117,25 +143,27 @@ void activeBeep(int durationMs, int pauseMs = 35) {
   if (pauseMs > 0) delay(pauseMs);
 }
 
+// 1. Access Granted: One short beep (~150-200ms)
 void soundAccessGranted() {
-  activeBeep(28, 25);
-  activeBeep(42, 30);
-  activeBeep(140, 0);
+  activeBeep(160, 0);
 }
 
+// 2. Access Denied (Expired): Three rapid short beeps (~100ms each, ~100ms gap)
+void soundAccessDeniedExpired() {
+  activeBeep(90, 90);
+  activeBeep(90, 90);
+  activeBeep(90, 0);
+}
+
+// 3. Access Denied (Fingerprint Not Recognized): Crisp double beep
 void soundAccessDeniedUnknown() {
   activeBeep(22, 55);
   activeBeep(22, 0);
 }
 
-void soundAccessDeniedExpired() {
-  activeBeep(70, 50);
-  activeBeep(70, 110);
-  activeBeep(200, 0);
-}
-
+// 4. Exit Button Pressed: Silent per spec
 void soundExitButton() {
-  activeBeep(32, 0);
+  // Silent - no feedback needed for exit
 }
 
 void soundSystemBoot() {
@@ -215,18 +243,229 @@ void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
   setAllLeds(r, g, b);
 }
 
-// Convert 0-255 wheel position into smooth RGB rainbow color
-uint32_t colorWheel(byte wheelPos) {
+// Convert 0-255 wheel position into smooth RGB rainbow color with adjustable brightness
+uint32_t colorWheel(byte wheelPos, uint8_t brightness = 255) {
   wheelPos = 255 - wheelPos;
+  uint8_t r = 0, g = 0, b = 0;
   if (wheelPos < 85) {
-    return strip.Color(255 - wheelPos * 3, 0, wheelPos * 3);
-  }
-  if (wheelPos < 170) {
+    r = 255 - wheelPos * 3;
+    g = 0;
+    b = wheelPos * 3;
+  } else if (wheelPos < 170) {
     wheelPos -= 85;
-    return strip.Color(0, wheelPos * 3, 255 - wheelPos * 3);
+    r = 0;
+    g = wheelPos * 3;
+    b = 255 - wheelPos * 3;
+  } else {
+    wheelPos -= 170;
+    r = wheelPos * 3;
+    g = 255 - wheelPos * 3;
+    b = 0;
   }
-  wheelPos -= 170;
-  return strip.Color(wheelPos * 3, 255 - wheelPos * 3, 0);
+  if (brightness < 255) {
+    r = (r * brightness) / 255;
+    g = (g * brightness) / 255;
+    b = (b * brightness) / 255;
+  }
+  return strip.Color(r, g, b);
+}
+
+volatile LedState currentLedState = LED_STATE_IDLE;
+
+void triggerLedAccessGranted() {
+  Serial.println("💡 [LED] Solid Green Triple Pulse (Access Granted)");
+  currentLedState = LED_STATE_GRANTED;
+}
+
+void triggerLedAccessDeniedExpired() {
+  Serial.println("💡 [LED] Rapid Red Pulse (Expired Membership)");
+  currentLedState = LED_STATE_DENIED_EXPIRED;
+}
+
+void triggerLedAccessDeniedUnknown() {
+  Serial.println("💡 [LED] Steady Orange/Amber (Unknown Finger)");
+  currentLedState = LED_STATE_DENIED_UNKNOWN;
+}
+
+void triggerLedEnrollYellow() {
+  currentLedState = LED_STATE_ENROLL_YELLOW;
+}
+
+void triggerLedEnrollPurple() {
+  currentLedState = LED_STATE_ENROLL_PURPLE;
+}
+
+void triggerLedEnrollSuccess() {
+  Serial.println("💡 [LED] Purple Completion Pulse (Enroll Success)");
+  currentLedState = LED_STATE_ENROLL_SUCCESS;
+}
+
+void triggerLedOff() {
+  currentLedState = LED_STATE_OFF;
+}
+
+void triggerLedIdle() {
+  currentLedState = LED_STATE_IDLE;
+}
+
+void showEnrollSpinner(uint8_t headIdx, uint8_t r, uint8_t g, uint8_t b) {
+  strip.clear();
+  headIdx = headIdx % NUM_LEDS;
+  uint8_t tail1 = (headIdx + NUM_LEDS - 1) % NUM_LEDS;
+  uint8_t tail2 = (headIdx + NUM_LEDS - 2) % NUM_LEDS;
+
+  strip.setPixelColor(headIdx, strip.Color(r, g, b));             // Bright head
+  strip.setPixelColor(tail1,   strip.Color(r / 3, g / 3, b / 3)); // Dim tail 1
+  strip.setPixelColor(tail2,   strip.Color(r / 8, g / 8, b / 8)); // Faint tail 2
+  strip.show();
+}
+
+// ==========================================
+// AESTHETIC DUAL-ORBIT PLASMA AURA (THEMES)
+// ==========================================
+struct AuraPalette {
+  uint8_t baseR, baseG, baseB;   // Ambient breathing base color
+  uint8_t c1R,   c1G,   c1B;     // Primary orbital plasma comet
+  uint8_t c2R,   c2G,   c2B;     // Harmonic counter-orbit comet
+};
+
+const AuraPalette AURA_THEMES[] = {
+  // 0. Cyberpunk Neo-Tokyo: Electric Cyan comet & Neon Magenta counter-comet over Deep Violet
+  { 18,  0,  35,    0, 240, 255,   255,   0, 150 },
+  // 1. Stark Arc Reactor: Ice White/Blue comet & Electric Azure counter-comet over Deep Cobalt
+  {  0, 10,  40,   80, 220, 255,   210, 245, 255 },
+  // 2. Emerald Cyber-Matrix: Neon Mint comet & Electric Lime counter-comet over Oceanic Teal
+  {  0, 22,  22,    0, 255, 120,   140, 255,   0 },
+  // 3. Solar Flare: Blazing Gold comet & Molten Crimson counter-comet over Deep Amber
+  { 30,  6,   0,  255, 180,   0,   255,  30,  10 }
+};
+
+const uint8_t NUM_AURA_THEMES = 4;
+
+// ==========================================
+// DEDICATED FREERTOS LED ENGINE (CORE 0)
+// Runs continuously without stopping, 100% immune to HTTPS / Wi-Fi blocking!
+// ==========================================
+void ledWorkerTask(void *pvParameters) {
+  uint16_t subPos1 = 0;
+  uint16_t subPos2 = 0;
+  uint8_t breathAngle = 0;
+  uint8_t spinnerIdx = 0;
+
+  while (true) {
+    // 1. If door is currently unlocked, hold solid emerald green
+    if (isSolenoidUnlocked) {
+      setAllLeds(0, 255, 0);
+      vTaskDelay(pdMS_TO_TICKS(25));
+      continue;
+    }
+
+    // 2. State-driven animations
+    if (currentLedState == LED_STATE_GRANTED) {
+      // Solid Green triple pulse
+      for (int pulse = 0; pulse < 3; pulse++) {
+        setAllLeds(0, 255, 0);
+        vTaskDelay(pdMS_TO_TICKS(110));
+        setAllLeds(0, 0, 0);
+        if (pulse < 2) vTaskDelay(pdMS_TO_TICKS(90));
+      }
+      setAllLeds(0, 255, 0);
+      currentLedState = LED_STATE_IDLE;
+      continue;
+    }
+
+    if (currentLedState == LED_STATE_DENIED_EXPIRED) {
+      // Rapid Red 4-pulse
+      for (int i = 0; i < 4; i++) {
+        setAllLeds(255, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        setAllLeds(0, 0, 0);
+        vTaskDelay(pdMS_TO_TICKS(90));
+      }
+      currentLedState = LED_STATE_IDLE;
+      continue;
+    }
+
+    if (currentLedState == LED_STATE_DENIED_UNKNOWN) {
+      // Solid steady Amber for 1.2s
+      setAllLeds(255, 100, 0);
+      vTaskDelay(pdMS_TO_TICKS(1200));
+      currentLedState = LED_STATE_IDLE;
+      continue;
+    }
+
+    if (currentLedState == LED_STATE_ENROLL_YELLOW) {
+      showEnrollSpinner(spinnerIdx++, 255, 180, 0);
+      vTaskDelay(pdMS_TO_TICKS(60));
+      continue;
+    }
+
+    if (currentLedState == LED_STATE_ENROLL_PURPLE) {
+      showEnrollSpinner(spinnerIdx++, 180, 0, 255);
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    if (currentLedState == LED_STATE_ENROLL_SUCCESS) {
+      for (int i = 0; i < 3; i++) {
+        setAllLeds(180, 0, 255);
+        vTaskDelay(pdMS_TO_TICKS(120));
+        setAllLeds(0, 0, 0);
+        if (i < 2) vTaskDelay(pdMS_TO_TICKS(80));
+      }
+      currentLedState = LED_STATE_IDLE;
+      continue;
+    }
+
+    if (currentLedState == LED_STATE_OFF) {
+      setAllLeds(0, 0, 0);
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+
+    // 3. CONTINUOUS DUAL-ORBIT PLASMA AURA (40 FPS, ZERO FREEZES)
+    subPos1 = (subPos1 + 420) % (256 * 256);
+    subPos2 = (subPos2 + (256 * 256) - 290) % (256 * 256);
+
+    uint8_t pos1 = subPos1 >> 8;
+    uint8_t pos2 = subPos2 >> 8;
+
+    breathAngle += 3;
+    uint8_t bTriangle = (breathAngle < 128) ? breathAngle : (255 - breathAngle);
+    uint8_t breathVal = 10 + (bTriangle * 28 / 128);
+
+    uint8_t currentTheme = (millis() / 12000) % NUM_AURA_THEMES;
+    const AuraPalette &pal = AURA_THEMES[currentTheme];
+
+    for (int i = 0; i < NUM_LEDS; i++) {
+      int ledAngle = i * 32;
+
+      int d1 = abs((int)pos1 - ledAngle);
+      if (d1 > 128) d1 = 256 - d1;
+      uint8_t w1 = (d1 < 44) ? ((44 - d1) * 255 / 44) : 0;
+
+      int d2 = abs((int)pos2 - ledAngle);
+      if (d2 > 128) d2 = 256 - d2;
+      uint8_t w2 = (d2 < 44) ? ((44 - d2) * 255 / 44) : 0;
+
+      uint8_t coreBoost1 = (d1 < 10) ? ((10 - d1) * 60 / 10) : 0;
+      uint8_t coreBoost2 = (d2 < 10) ? ((10 - d2) * 40 / 10) : 0;
+
+      int r = ((int)pal.baseR * breathVal) / 255 + ((int)pal.c1R * w1) / 255 + ((int)pal.c2R * w2) / 255 + coreBoost1 + coreBoost2;
+      int g = ((int)pal.baseG * breathVal) / 255 + ((int)pal.c1G * w1) / 255 + ((int)pal.c2G * w2) / 255 + coreBoost1 + coreBoost2;
+      int b = ((int)pal.baseB * breathVal) / 255 + ((int)pal.c1B * w1) / 255 + ((int)pal.c2B * w2) / 255 + coreBoost1 + coreBoost2;
+
+      strip.setPixelColor(i, strip.Color(
+        r > 255 ? 255 : r,
+        g > 255 ? 255 : g,
+        b > 255 ? 255 : b
+      ));
+    }
+    strip.show();
+
+    // Rock-solid 40 FPS
+    vTaskDelay(pdMS_TO_TICKS(25));
+  }
 }
 
 // Visual Diagnostic & Hardware Showcase Test (Runs on Boot)
@@ -252,6 +491,20 @@ void runLedStartupTest() {
   strip.clear();
   strip.show();
   delay(120);
+
+  // Test 1b: Half-Split Hardware Diagnostic (LEDs 1-4 RED, LEDs 5-8 BLUE)
+  Serial.println("🧪 Phase 1b: Half-Split Diagnostic (LEDs 1-4 RED, LEDs 5-8 BLUE)...");
+  for (int i = 0; i < 4; i++) {
+    strip.setPixelColor(i, strip.Color(255, 0, 0)); // LEDs 1-4 Red
+  }
+  for (int i = 4; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, strip.Color(0, 80, 255)); // LEDs 5-8 Blue
+  }
+  strip.show();
+  delay(1200);
+  strip.clear();
+  strip.show();
+  delay(100);
 
   // Test 2: Color Spectrum Wipes across all 8 LEDs
   Serial.println("🧪 Phase 2: Color Spectrum Wipes (Red -> Green -> Blue -> Amber -> Purple -> White)...");
@@ -306,82 +559,15 @@ void runLedStartupTest() {
     delay(10);
   }
 
-  // Test 5: Soft fade-in to Standby Cyan/Blue Aura
-  Serial.println("✅ [LED TEST] All 8 LEDs verified operational! Standby Aura armed.\n");
-  for (int b = 10; b <= 60; b += 5) {
+  // Test 5: Soft fade-in to Standby Dim Gradient
+  Serial.println("✅ [LED TEST] All 8 LEDs verified operational! Idle Gradient armed.\n");
+  for (int b = 10; b <= 45; b += 5) {
     for (int i = 0; i < NUM_LEDS; i++) {
-      strip.setPixelColor(i, strip.Color(0, b / 2, b));
+      strip.setPixelColor(i, colorWheel(i * 32, b));
     }
     strip.show();
     delay(20);
   }
-}
-
-void triggerLedAccessGranted() {
-  Serial.println("💡 [LED] Emerald Green Cascade (Access Granted)");
-  for (int pulse = 0; pulse < 2; pulse++) {
-    setAllLeds(0, 255, 50);
-    delay(80);
-    setAllLeds(0, 40, 15);
-    delay(60);
-  }
-  // Fast circular spin
-  for (int rot = 0; rot < NUM_LEDS * 2; rot++) {
-    strip.clear();
-    for (int i = 0; i < 3; i++) {
-      strip.setPixelColor((rot + i) % NUM_LEDS, strip.Color(0, 255, 60));
-    }
-    strip.show();
-    delay(25);
-  }
-  setAllLeds(0, 200, 40);
-}
-
-void triggerLedAccessDeniedExpired() {
-  Serial.println("💡 [LED] Triple Red Strobe (Expired / Inactive)");
-  for (int i = 0; i < 3; i++) {
-    setAllLeds(255, 0, 0);
-    delay(90);
-    setAllLeds(0, 0, 0);
-    delay(70);
-  }
-}
-
-void triggerLedAccessDeniedUnknown() {
-  Serial.println("💡 [LED] Double Amber Strobe (Unknown Finger)");
-  for (int i = 0; i < 2; i++) {
-    setAllLeds(255, 120, 0);
-    delay(110);
-    setAllLeds(0, 0, 0);
-    delay(80);
-  }
-}
-
-void triggerLedEnrollScanning() {
-  Serial.println("💡 [LED] Cyan Scanning Spinner");
-  for (int i = 0; i < NUM_LEDS; i++) {
-    strip.clear();
-    strip.setPixelColor(i, strip.Color(0, 200, 255));
-    strip.setPixelColor((i + 1) % NUM_LEDS, strip.Color(0, 100, 255));
-    strip.show();
-    delay(50);
-  }
-}
-
-void triggerLedEnrollSuccess() {
-  Serial.println("💡 [LED] Violet & Green Rainbow Burst (Enroll Success)");
-  for (int j = 0; j < 256; j += 16) {
-    for (int i = 0; i < NUM_LEDS; i++) {
-      strip.setPixelColor(i, colorWheel(j + (i * 32)));
-    }
-    strip.show();
-    delay(10);
-  }
-  setAllLeds(0, 255, 80);
-}
-
-void triggerLedOff() {
-  setAllLeds(0, 0, 0);
 }
 
 // ==========================================
@@ -446,6 +632,16 @@ String extractJsonField(const String &json, const String &fieldName) {
       return json.substring(firstQuote + 1, endQuote);
     }
   }
+
+  // 5. Plain JSON unquoted value fallback: "fieldName": true / false / 123
+  int start = colonIdx + 1;
+  while (start < json.length() && (json[start] == ' ' || json[start] == '\t')) start++;
+  if (json.startsWith("true", start)) return "true";
+  if (json.startsWith("false", start)) return "false";
+  if (json.startsWith("null", start)) return "null";
+  int end = start;
+  while (end < json.length() && ((json[end] >= '0' && json[end] <= '9') || json[end] == '-')) end++;
+  if (end > start) return json.substring(start, end);
 
   return "";
 }
@@ -592,6 +788,14 @@ void checkMemberCacheSyncSignal() {
           prefs.begin("fb_cache", false);
           prefs.remove(("s_" + String(slot)).c_str());
           prefs.end();
+
+          // Physically delete fingerprint template from R307S optical sensor flash to free up space!
+          uint8_t err = finger.deleteModel(slot);
+          if (err == FINGERPRINT_OK) {
+            Serial.printf("🗑️ [HARDWARE SENSOR] Fingerprint template in Slot #%d deleted from R307S (Slot is now free!).\n", slot);
+          } else {
+            Serial.printf("⚠️ [HARDWARE SENSOR] deleteModel Slot #%d returned code: 0x%02X\n", slot, err);
+          }
           Serial.printf("🗑️ [CACHE] Removed Slot #%d from local cache.\n", slot);
         } else {
           saveMemberToLocalCache((uint8_t)slot, (status == "active"), expiry, name);
@@ -735,7 +939,166 @@ void logAccessEvent(String type, String memberId, String reason) {
   https.end();
 }
 
-// Check for Remote Door Unlock commands from Dashboard
+// ==========================================
+// 6B. FIREBASE REALTIME DATABASE (RTDB) ZERO-READ SSE ENGINE
+// Push-driven instant communication (<150ms) with $0 Firestore read cost
+// ==========================================
+WiFiClientSecure rtdbStreamClient;
+bool isRtdbStreamActive = false;
+unsigned long lastRtdbConnectAttempt = 0;
+
+void sendRtdbPut(const String &subPath, const String &jsonPayload) {
+  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  String url = "https://" + String(FIREBASE_RTDB_HOST) + "/gyms/" + linkedGymId + "/live/" + subPath + ".json";
+  String token = getFirebaseAuthToken();
+  if (token.length() > 0) {
+    url += "?auth=" + token;
+  }
+  if (https.begin(client, url)) {
+    https.addHeader("Content-Type", "application/json");
+    https.PUT(jsonPayload);
+    https.end();
+  }
+}
+
+void handleRtdbEvent(const String &path, const String &dataJson) {
+  // 1. Remote Unlock Command
+  if (dataJson.indexOf("\"command\":\"UNLOCK\"") != -1 || dataJson.indexOf("\"action\":\"UNLOCK\"") != -1) {
+    String st = extractJsonField(dataJson, "status");
+    if (st == "PENDING" || st == "") {
+      Serial.println("\n⚡ [RTDB REALTIME] Instant Remote Unlock command received from Web Dashboard!");
+      soundAccessGranted();
+      triggerLedAccessGranted();
+      triggerSolenoid(3);
+      logAccessEvent("REMOTE_UNLOCK", "ADMIN", "Dashboard Remote Open (RTDB)");
+      sendRtdbPut("command/status", "\"COMPLETED\"");
+    }
+  }
+
+  // 2. Dashboard PING (Instant Ping-Pong)
+  if (dataJson.indexOf("\"command\":\"PING\"") != -1) {
+    String st = extractJsonField(dataJson, "status");
+    if (st == "PENDING") {
+      Serial.println("\n📡 [RTDB REALTIME] Instant PING received! Replying PONG...");
+      String pongPayload = "{\"command\":\"PING\",\"status\":\"PONG\",\"pong_timestamp\":\"" + String(millis()) + "\",\"wifi_rssi\":" + String(WiFi.RSSI()) + "}";
+      sendRtdbPut("command", pongPayload);
+    }
+  }
+
+  // 3. Biometric Enrollment Command
+  if (dataJson.indexOf("\"command\":\"ENROLL\"") != -1) {
+    String st = extractJsonField(dataJson, "status");
+    if (st == "PENDING") {
+      Serial.println("\n🌐 [RTDB REALTIME] Biometric Enrollment Command Received from Web Dashboard!");
+      runEnrollmentProcess();
+    }
+  }
+
+  // 4. Member Cache Sync Signal
+  if (dataJson.indexOf("\"sync_needed\":true") != -1 || dataJson.indexOf("\"sync_needed\":\"true\"") != -1) {
+    Serial.println("\n🔔 [RTDB REALTIME] Instant Member Sync Signal detected!");
+    String slotStr = extractJsonField(dataJson, "slot_id");
+    if (slotStr.length() > 0 && slotStr != "ALL") {
+      int slot = slotStr.toInt();
+      String status = extractJsonField(dataJson, "status");
+      String expiry = extractJsonField(dataJson, "expiry_date");
+      String name   = extractJsonField(dataJson, "name");
+
+      if (status == "deleted") {
+        localCache[slot].valid = false;
+        prefs.begin("fb_cache", false);
+        prefs.remove(("s_" + String(slot)).c_str());
+        prefs.end();
+
+        uint8_t err = finger.deleteModel(slot);
+        if (err == FINGERPRINT_OK) {
+          Serial.printf("🗑️ [HARDWARE SENSOR] Fingerprint template in Slot #%d deleted from R307S.\n", slot);
+        }
+        Serial.printf("🗑️ [CACHE] Removed Slot #%d from local cache.\n", slot);
+      } else {
+        saveMemberToLocalCache((uint8_t)slot, (status == "active"), expiry, name);
+        Serial.printf("⚡ [CACHE] Targeted single-slot update: Slot #%d (%s, %s)\n", slot, name.c_str(), status.c_str());
+      }
+    } else {
+      syncActiveMembersCache();
+    }
+    sendRtdbPut("sync/sync_needed", "false");
+  }
+
+  // 5. Remote OTA Check
+  if (dataJson.indexOf("\"command\":\"CHECK_OTA\"") != -1) {
+    String st = extractJsonField(dataJson, "status");
+    if (st == "PENDING") {
+      Serial.println("\n🚀 [RTDB REALTIME] Remote OTA check command received!");
+      sendRtdbPut("command/status", "\"COMPLETED\"");
+      checkOtaUpdate();
+    }
+  }
+}
+
+void processRtdbStream() {
+  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
+
+  // Reconnection logic
+  if (!rtdbStreamClient.connected()) {
+    if (isRtdbStreamActive) {
+      Serial.println("⚠️ [RTDB] Stream disconnected. Reconnecting...");
+      isRtdbStreamActive = false;
+    }
+    if (millis() - lastRtdbConnectAttempt > 5000) {
+      lastRtdbConnectAttempt = millis();
+      Serial.println("🌐 [RTDB] Connecting to Firebase Realtime Database SSE Stream...");
+      rtdbStreamClient.stop();
+      rtdbStreamClient.setInsecure();
+      rtdbStreamClient.setTimeout(4000);
+      if (rtdbStreamClient.connect(FIREBASE_RTDB_HOST, 443)) {
+        String path = "/gyms/" + linkedGymId + "/live.json";
+        String token = getFirebaseAuthToken();
+        if (token.length() > 0) {
+          path += "?auth=" + token;
+        }
+        rtdbStreamClient.print(
+          String("GET ") + path + " HTTP/1.1\r\n" +
+          "Host: " + FIREBASE_RTDB_HOST + "\r\n" +
+          "Accept: text/event-stream\r\n" +
+          "Connection: keep-alive\r\n\r\n"
+        );
+        isRtdbStreamActive = true;
+        Serial.println("⚡ [RTDB] Connected! Push-driven Realtime Stream is ACTIVE (0 Firestore reads).");
+      } else {
+        Serial.println("⚠️ [RTDB] Connection to RTDB failed. Retrying in 5s...");
+      }
+    }
+    return;
+  }
+
+  // Non-blocking stream read
+  static String sseEvent = "";
+  while (rtdbStreamClient.available()) {
+    String line = rtdbStreamClient.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    if (line.startsWith("event:")) {
+      sseEvent = line.substring(6);
+      sseEvent.trim();
+    } else if (line.startsWith("data:")) {
+      String sseData = line.substring(5);
+      sseData.trim();
+      if (sseEvent == "put" || sseEvent == "patch") {
+        String path = extractJsonField(sseData, "path");
+        handleRtdbEvent(path, sseData);
+      }
+      sseEvent = "";
+    }
+  }
+}
+
+// Check for Remote Door Unlock commands from Dashboard (Fallback)
 void checkRemoteUnlockCommand() {
   if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
 
@@ -755,6 +1118,7 @@ void checkRemoteUnlockCommand() {
     if (cmd == "UNLOCK" && st == "PENDING") {
       Serial.println("\n⚡ [REMOTE UNLOCK] Command received from Web Dashboard!");
       soundAccessGranted();
+      triggerLedAccessGranted();
       triggerSolenoid(3);
       logAccessEvent("REMOTE_UNLOCK", "ADMIN", "Dashboard Remote Open");
 
@@ -820,6 +1184,10 @@ void checkEnrollmentRequest() {
 }
 
 void updateEnrollmentStatus(String status, uint8_t fingerId) {
+  // Push status immediately to Firebase Realtime Database
+  String rtdbPayload = "{\"command\":\"IDLE\",\"status\":\"" + status + "\",\"fingerprint_id\":\"" + String(fingerId) + "\",\"timestamp\":" + String(millis()) + "}";
+  sendRtdbPut("enrollment", rtdbPayload);
+
   if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
   
   WiFiClientSecure client;
@@ -865,6 +1233,15 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   Serial.printf("\n🚀 [OTA] Starting Over-The-Air firmware flash: %s\n", targetVersion.c_str());
   reportOtaStatus("DOWNLOADING", FIRMWARE_VERSION);
 
+  // 🛑 SUSPEND BACKGROUND LED ENGINE BEFORE FLASHING SPI FLASH MEMORY!
+  // Writing to Flash disables CPU instruction cache. Running FreeRTOS tasks
+  // that output NeoPixel RMT waveforms from Core 0 during flash write causes
+  // cache bus contention and halts LED updates mid-frame!
+  if (ledTaskHandle != NULL) {
+    vTaskSuspend(ledTaskHandle);
+  }
+  setAllLeds(255, 90, 0); // Solid Amber: OTA Update in progress
+
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient https;
@@ -873,6 +1250,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   if (!https.begin(client, binUrl)) {
     Serial.println("❌ [OTA] Could not connect to binary download URL.");
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
+    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
     return;
   }
 
@@ -880,6 +1258,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   if (httpCode != 200) {
     Serial.printf("❌ [OTA] HTTP error fetching binary: %d\n", httpCode);
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
+    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
     https.end();
     return;
   }
@@ -888,6 +1267,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   if (contentLength <= 0) {
     Serial.println("❌ [OTA] Invalid content length.");
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
+    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
     https.end();
     return;
   }
@@ -896,6 +1276,7 @@ void performOtaUpdate(String binUrl, String targetVersion) {
   if (!canBegin) {
     Serial.println("❌ [OTA] Not enough space on OTA partition.");
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
+    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
     https.end();
     return;
   }
@@ -907,12 +1288,14 @@ void performOtaUpdate(String binUrl, String targetVersion) {
     if (Update.isFinished()) {
       Serial.println("🎉 [OTA] Firmware flash SUCCESSFUL! Rebooting into new image...");
       reportOtaStatus("REBOOTING", targetVersion);
+      setAllLeds(0, 255, 0); // Solid Green before reboot
       delay(1000);
       ESP.restart();
     }
   } else {
     Serial.printf("❌ [OTA] Flash write failed! Written: %d / %d. Error #: %d\n", written, contentLength, Update.getError());
     reportOtaStatus("ERROR", FIRMWARE_VERSION);
+    if (ledTaskHandle != NULL) vTaskResume(ledTaskHandle);
   }
   https.end();
 }
@@ -947,31 +1330,63 @@ void checkOtaUpdate() {
 // 8. ENROLLMENT SEQUENCE
 // ==========================================
 void runEnrollmentProcess() {
-  triggerLedEnrollScanning();
   soundEnrollPrompt();
   Serial.println("👉 [ENROLL] Place finger on scanner (Touch 1)...");
   
   finger.getTemplateCount();
-  if (finger.templateCount >= MAX_SENSOR_CAPACITY) {
+  Serial.printf("📊 [ENROLL] Current sensor templates stored: %d / %d\n", finger.templateCount, MAX_SENSOR_CAPACITY);
+
+  // Find first available free slot (1 to MAX_SENSOR_CAPACITY) to recycle deleted slots
+  uint8_t nextSlot = 0;
+  for (uint8_t i = 1; i <= MAX_SENSOR_CAPACITY; i++) {
+    if (!localCache[i].valid) {
+      if (finger.loadModel(i) != FINGERPRINT_OK) {
+        nextSlot = i;
+        break;
+      }
+    }
+  }
+
+  // Fallback: check any slot that doesn't have an active template on sensor
+  if (nextSlot == 0) {
+    for (uint8_t i = 1; i <= MAX_SENSOR_CAPACITY; i++) {
+      if (finger.loadModel(i) != FINGERPRINT_OK) {
+        nextSlot = i;
+        break;
+      }
+    }
+  }
+
+  if (nextSlot == 0 || nextSlot > MAX_SENSOR_CAPACITY) {
+    Serial.println("❌ [ENROLL] Sensor storage is full! No free slots available.");
     soundEnrollFailed();
+    triggerLedAccessDeniedExpired();
     updateEnrollmentStatus("SENSOR_FULL", 0);
     return;
   }
 
-  uint8_t nextSlot = finger.templateCount + 1;
+  Serial.printf("🎯 [ENROLL] Assigned Slot #%d for new member registration.\n", nextSlot);
 
-  // Touch 1
+  // Touch 1: Yellow rotating spinner animation while scanning
   int p = -1;
   unsigned long timeout = millis() + 15000;
+  triggerLedEnrollYellow();
   while (p != FINGERPRINT_OK && millis() < timeout) {
     p = finger.getImage();
     delay(50);
   }
   if (p != FINGERPRINT_OK || finger.image2Tz(1) != FINGERPRINT_OK) {
     soundEnrollFailed();
+    triggerLedAccessDeniedExpired();
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
+
+  // Touch 1 captured: Purple rotating animation
+  Serial.println("👉 [ENROLL] Touch 1 Scanned! Remove finger...");
+  soundEnrollStep1();
+  triggerLedEnrollPurple();
+  delay(800);
 
   // Check if finger is ALREADY enrolled on this sensor to prevent duplicate slots
   if (finger.fingerFastSearch() == FINGERPRINT_OK) {
@@ -984,29 +1399,31 @@ void runEnrollmentProcess() {
     return;
   }
   
-  soundEnrollStep1();
-  delay(1000);
   p = 0;
   while (p != FINGERPRINT_NOFINGER) {
     p = finger.getImage();
     delay(50);
   }
 
-  // Touch 2
+  // Touch 2: Yellow rotating spinner while waiting for 2nd touch
+  Serial.println("👉 [ENROLL] Place same finger again (Touch 2)...");
   p = -1;
   timeout = millis() + 15000;
+  triggerLedEnrollYellow();
   while (p != FINGERPRINT_OK && millis() < timeout) {
     p = finger.getImage();
     delay(50);
   }
   if (p != FINGERPRINT_OK || finger.image2Tz(2) != FINGERPRINT_OK) {
     soundEnrollFailed();
+    triggerLedAccessDeniedExpired();
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
 
   if (finger.createModel() != FINGERPRINT_OK) {
     soundEnrollFailed();
+    triggerLedAccessDeniedExpired();
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
@@ -1014,12 +1431,13 @@ void runEnrollmentProcess() {
   if (finger.storeModel(nextSlot) == FINGERPRINT_OK) {
     Serial.printf("🎉 Enrolled into Slot #%d!\n", nextSlot);
     soundEnrollSuccess();
-    triggerLedEnrollSuccess();
+    triggerLedEnrollSuccess(); // Purple completion pulse
     // Pre-cache immediately so member can scan right away!
     saveMemberToLocalCache(nextSlot, true, "2099-12-31", "New Member");
     updateEnrollmentStatus("SUCCESS", nextSlot);
   } else {
     soundEnrollFailed();
+    triggerLedAccessDeniedExpired();
     updateEnrollmentStatus("ERROR", 0);
   }
 }
@@ -1040,13 +1458,15 @@ void handleFingerprintVerification() {
 
   if (p != FINGERPRINT_OK || finger.image2Tz() != FINGERPRINT_OK) {
     soundAccessDeniedUnknown();
-    delay(400);
+    triggerLedAccessDeniedUnknown(); // Steady amber LED + buzzer beep
+    delay(1000);
     return;
   }
 
   if (finger.fingerFastSearch() != FINGERPRINT_OK) {
     Serial.println("❌ Access Denied: Unknown Fingerprint.");
     soundAccessDeniedUnknown();
+    triggerLedAccessDeniedUnknown(); // Steady amber LED + buzzer beep
     logAccessEvent("DENIED", "UNKNOWN", "Not recognized");
     delay(1200);
     return;
@@ -1065,26 +1485,31 @@ void handleFingerprintVerification() {
     Serial.printf("⚡ [LOCAL CACHE HIT] %s | Active: %d | Expiry: %s | Today: %s\n", 
                   memberName.c_str(), active, expiry.c_str(), todayDate.c_str());
 
+    // 2. Access Denied: Inactive membership
     if (!active) {
       Serial.printf("🔴 ACCESS DENIED: Membership Inactive for %s\n", memberName.c_str());
-      soundAccessDeniedExpired();
+      soundAccessDeniedExpired();        // 3 rapid short beeps
+      triggerLedAccessDeniedExpired();   // Rapid red pulse
       logAccessEvent("DENIED", String(slotId), "Membership inactive");
-      delay(1200);
+      delay(400);
       return;
     }
 
+    // 2. Access Denied: Expired membership
     if (expiry.length() == 10 && todayDate.length() == 10 && expiry < todayDate) {
       Serial.printf("🔴 ACCESS DENIED: Membership Expired for %s\n", memberName.c_str());
-      soundAccessDeniedExpired();
+      soundAccessDeniedExpired();        // 3 rapid short beeps
+      triggerLedAccessDeniedExpired();   // Rapid red pulse
       logAccessEvent("DENIED", String(slotId), "Membership expired");
-      delay(1200);
+      delay(400);
       return;
     }
 
-    // GRANTED INSTANTLY!
+    // 1. ACCESS GRANTED: Valid fingerprint + Active membership!
     Serial.printf("🟢 ACCESS GRANTED (INSTANT LOCAL)! Welcome, %s!\n", memberName.c_str());
-    soundAccessGranted();
-    triggerSolenoid(3);
+    soundAccessGranted();              // One short beep (~160ms)
+    triggerLedAccessGranted();         // Blinks solid green (triple pulse) & holds green
+    triggerSolenoid(3);                // Solenoid activates for 3 seconds
     logAccessEvent("GRANTED", String(slotId), "Active membership (Local)");
     return;
   }
@@ -1126,17 +1551,19 @@ void handleFingerprintVerification() {
           if (status == "active" && (expiry.length() < 10 || todayDate.length() < 10 || expiry >= todayDate)) {
             Serial.printf("🟢 ACCESS GRANTED (CLOUD)! Welcome, %s!\n", name.c_str());
             saveMemberToLocalCache(slotId, true, expiry, name);
-            soundAccessGranted();
-            triggerSolenoid(3);
+            soundAccessGranted();            // One short beep (~160ms)
+            triggerLedAccessGranted();       // Blinks solid green (triple pulse) & holds green
+            triggerSolenoid(3);              // Solenoid activates for 3 seconds
             logAccessEvent("GRANTED", String(slotId), "Active membership (Cloud)");
             https.end();
             return;
           } else {
             Serial.println("🔴 ACCESS DENIED: Expired or inactive in cloud.");
             saveMemberToLocalCache(slotId, false, expiry, name);
-            soundAccessDeniedExpired();
+            soundAccessDeniedExpired();      // 3 rapid short beeps
+            triggerLedAccessDeniedExpired(); // Rapid red pulse
             logAccessEvent("DENIED", String(slotId), "Expired/Inactive");
-            delay(1200);
+            delay(400);
             https.end();
             return;
           }
@@ -1155,9 +1582,10 @@ void handleFingerprintVerification() {
     }
   }
 
-  // FAIL CLOSED
+  // FAIL CLOSED (3. Unknown / unverified)
   Serial.println("⚠️ Access Denied: Unverified record.");
   soundAccessDeniedUnknown();
+  triggerLedAccessDeniedUnknown();
   logAccessEvent("DENIED", String(slotId), "Unverified");
   delay(1200);
 }
@@ -1282,6 +1710,9 @@ void setup() {
   pinMode(TOUCH_PIN, INPUT_PULLUP);
   pinMode(EXIT_BUTTON_PIN, INPUT_PULLUP);
 
+  // Maximize GPIO 18 drive strength for pristine SK6812 NeoPixel waveform edges
+  gpio_set_drive_capability((gpio_num_t)LED_PIN, GPIO_DRIVE_CAP_3);
+
   Serial.begin(9600);
   delay(100);
   Serial.println("\n\n========================================");
@@ -1290,6 +1721,19 @@ void setup() {
 
   // --- 8-LED Hardware Diagnostic & Showcase Sequence ---
   runLedStartupTest();
+
+  // 🚀 SPAWN UNSTOPPABLE BACKGROUND LED ENGINE ON CORE 0
+  // Completely isolates LED rendering from Wi-Fi / HTTPS network latency!
+  xTaskCreatePinnedToCore(
+    ledWorkerTask,
+    "LED_Aura_Engine",
+    4096,
+    NULL,
+    1,
+    &ledTaskHandle,
+    0
+  );
+  Serial.println("✨ [CORE 0] Background LED Aura Engine active (40 FPS Continuous).");
 
   // Dual-Partition OTA Rollback Self-Test
   const esp_partition_t *runningPartition = esp_ota_get_running_partition();
@@ -1410,12 +1854,19 @@ void loop() {
     handleFingerprintVerification();
   }
 
-  // 3. Command & Sync Polling (Enrollment, Remote Unlock, and Event-Driven Sync Signal)
-  if (millis() - lastCommandCheck > COMMAND_CHECK_INTERVAL) {
-    lastCommandCheck = millis();
-    checkEnrollmentRequest();
-    checkRemoteUnlockCommand();
-    checkMemberCacheSyncSignal(); // 💡 ONLY syncs when website actually modified records!
+  // 3. Firebase Realtime Database SSE Stream (Zero-read Push Events)
+  processRtdbStream();
+
+  // If RTDB stream is active, periodic polling is DISABLED (0 Firestore reads!).
+  // If RTDB stream is disconnected/reconnecting, fallback polling runs safely every 4s.
+  static unsigned long lastCommandPoll = 0;
+  static uint8_t pollStep = 0;
+  if (!isRtdbStreamActive && (millis() - lastCommandPoll > 4000)) {
+    lastCommandPoll = millis();
+    pollStep = (pollStep + 1) % 3;
+    if (pollStep == 0) checkRemoteUnlockCommand();
+    else if (pollStep == 1) checkEnrollmentRequest();
+    else if (pollStep == 2) checkMemberCacheSyncSignal();
   }
 
   // 4. Infrequent OTA Check (Every 30 mins)
@@ -1444,25 +1895,5 @@ void loop() {
     }
   }
 
-  // Standby Ambient LED Animation (Non-blocking Smooth Aura across 8 LEDs)
-  static unsigned long lastLedFrame = 0;
-  static uint8_t ledFrameStep = 0;
-  if (!isSolenoidUnlocked && millis() - lastLedFrame > 40) {
-    lastLedFrame = millis();
-    ledFrameStep++;
-    for (int i = 0; i < NUM_LEDS; i++) {
-      uint8_t angle = (ledFrameStep * 3 + (i * 256 / NUM_LEDS)) & 255;
-      uint8_t intensity = (angle < 128) ? (angle * 2) : ((255 - angle) * 2);
-      uint8_t r = 0;
-      uint8_t g = map(intensity, 0, 255, 6, 50);
-      uint8_t b = map(intensity, 0, 255, 20, 110);
-      strip.setPixelColor(i, strip.Color(r, g, b));
-    }
-    strip.show();
-  } else if (isSolenoidUnlocked) {
-    // Solid Emerald Green glow while door is actively unlocked
-    setAllLeds(0, 200, 40);
-  }
-
-  delay(20);
+  delay(10);
 }
