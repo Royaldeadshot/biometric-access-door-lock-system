@@ -130,6 +130,7 @@ void sendRtdbHeartbeat();
 void updateSolenoidState();
 String extractJsonField(const String &json, const String &fieldName);
 String getTodayDateString();
+void syncTimeViaHttp();
 void logAccessEvent(String type, String memberId, String reason);
 void applyAuthHeader(HTTPClient &https);
 void runEnrollmentProcess();
@@ -924,6 +925,35 @@ String resolveGymIdFromLinkingKey(String key) {
   return "";
 }
 
+// Instant RTC Clock Synchronization via Google/Firestore HTTP Date header (<100ms fallback for blocked UDP NTP)
+void syncTimeViaHttp() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  time_t now = time(nullptr);
+  if (now > 1700000000) return; // Already synchronized!
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  if (https.begin(client, "https://firestore.googleapis.com")) {
+    const char* headers[] = {"Date"};
+    https.collectHeaders(headers, 1);
+    https.setTimeout(2500);
+    int httpCode = https.sendRequest("HEAD");
+    if (httpCode > 0 && https.hasHeader("Date")) {
+      String dateStr = https.header("Date");
+      struct tm tm;
+      // HTTP-date format: "Mon, 02 Nov 2026 14:14:37 GMT"
+      if (strptime(dateStr.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm)) {
+        time_t t = mktime(&tm);
+        struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+        settimeofday(&tv, NULL);
+        Serial.println("🕒 [TIME SYNC] RTC clock synchronized via HTTP Date header: " + dateStr);
+      }
+    }
+    https.end();
+  }
+}
+
 // Log event to Firestore (with offline fallback)
 void logAccessEvent(String type, String memberId, String reason) {
   if (WiFi.status() != WL_CONNECTED || linkedGymId == "") {
@@ -941,12 +971,17 @@ void logAccessEvent(String type, String memberId, String reason) {
   applyAuthHeader(https);
   https.setTimeout(2500);
 
-  // Compute real Unix epoch timestamp (ms) and ISO string via NTP
+  // Ensure real Unix epoch timestamp (ms) and ISO string via NTP / HTTP Date header
   time_t now = time(nullptr);
+  if (now <= 1700000000) {
+    syncTimeViaHttp();
+    now = time(nullptr);
+  }
+
   String timestampStr;
   String isoCreatedAt = "";
 
-  if (now > 1700000000) { // NTP time valid (after Nov 2023)
+  if (now > 1700000000) { // Valid real-world time
     unsigned long long epochMs = ((unsigned long long)now) * 1000ULL;
     char msBuf[24];
     snprintf(msBuf, sizeof(msBuf), "%llu", epochMs);
@@ -971,7 +1006,19 @@ void logAccessEvent(String type, String memberId, String reason) {
     (isoCreatedAt.length() > 0 ? ",\"created_at\":{\"stringValue\":\"" + isoCreatedAt + "\"}" : "") +
   "}}";
   
-  https.POST(payload);
+  const char* dateHeader[] = {"Date"};
+  https.collectHeaders(dateHeader, 1);
+  int httpCode = https.POST(payload);
+  if (httpCode > 0 && https.hasHeader("Date") && time(nullptr) <= 1700000000) {
+    String dateStr = https.header("Date");
+    struct tm tm;
+    if (strptime(dateStr.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm)) {
+      time_t t = mktime(&tm);
+      struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+      settimeofday(&tv, NULL);
+      Serial.println("🕒 [TIME] Synced system clock from Google HTTP response: " + dateStr);
+    }
+  }
   https.end();
 }
 
@@ -1950,6 +1997,7 @@ void setup() {
     #else
       configTime(19800, 0, "pool.ntp.org", "time.google.com"); // UTC+5:30 (India)
     #endif
+    syncTimeViaHttp(); // Instant fallback via HTTP Date header
 
     // OTA Self-Test Verification Check: Cancel rollback if healthy
     if (otaState == ESP_OTA_IMG_PENDING_VERIFY) {
