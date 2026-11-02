@@ -16,7 +16,7 @@
 // ==========================================
 // 1. PIN DEFINITIONS & CONSTANTS
 // ==========================================
-#define FIRMWARE_VERSION "v1.2.5"
+#define FIRMWARE_VERSION "v1.3.0"
 
 // Fingerprint Sensor (R307S)
 #define RX_PIN 16         // ESP32 RX2 <- R307S TX (Yellow Wire)
@@ -112,6 +112,9 @@ enum LedState {
   LED_STATE_OFF
 };
 
+volatile LedState currentLedState = LED_STATE_IDLE;
+unsigned long ledStateStartedAt = 0;
+
 void triggerLedAccessGranted();
 void triggerLedAccessDeniedExpired();
 void triggerLedAccessDeniedUnknown();
@@ -120,7 +123,10 @@ void triggerLedEnrollPurple();
 void triggerLedEnrollSuccess();
 void triggerLedOff();
 void triggerLedIdle();
+void showEnrollSpinner(uint8_t headIdx, uint8_t r, uint8_t g, uint8_t b);
 void updateLedSystem();
+void performFactoryReset();
+void sendRtdbHeartbeat();
 void updateSolenoidState();
 String extractJsonField(const String &json, const String &fieldName);
 String getTodayDateString();
@@ -224,6 +230,7 @@ void updateSolenoidState() {
   if (isSolenoidUnlocked && millis() >= solenoidRelockAt) {
     digitalWrite(RELAY_PIN, RELAY_INACTIVE_LEVEL);
     isSolenoidUnlocked = false;
+    currentLedState = LED_STATE_IDLE;
     Serial.println("🔒 [DOOR LOCK] Relocked.");
   }
 }
@@ -269,43 +276,47 @@ uint32_t colorWheel(byte wheelPos, uint8_t brightness = 255) {
   return strip.Color(r, g, b);
 }
 
-volatile LedState currentLedState = LED_STATE_IDLE;
-unsigned long ledStateStartedAt = 0;
-
 void triggerLedAccessGranted() {
-  Serial.println("💡 [LED] Solid Green Triple Pulse (Access Granted)");
+  Serial.println("🟢 [LED] Instant Emerald Green (Access Granted)");
   currentLedState = LED_STATE_GRANTED;
   ledStateStartedAt = millis();
+  setAllLeds(0, 255, 0); // INSTANT HARDWARE WRITE (<0.24ms)
 }
 
 void triggerLedAccessDeniedExpired() {
-  Serial.println("💡 [LED] Rapid Red Pulse (Expired Membership)");
+  Serial.println("🔴 [LED] Rapid Red Pulse (Expired Membership)");
   currentLedState = LED_STATE_DENIED_EXPIRED;
   ledStateStartedAt = millis();
+  setAllLeds(255, 0, 0); // INSTANT HARDWARE WRITE (<0.24ms)
 }
 
 void triggerLedAccessDeniedUnknown() {
-  Serial.println("💡 [LED] Steady Orange/Amber (Unknown Finger)");
+  Serial.println("🟠 [LED] Instant Steady Amber (Unknown Finger)");
   currentLedState = LED_STATE_DENIED_UNKNOWN;
   ledStateStartedAt = millis();
+  setAllLeds(255, 100, 0); // INSTANT HARDWARE WRITE (<0.24ms)
 }
 
 void triggerLedEnrollYellow() {
   currentLedState = LED_STATE_ENROLL_YELLOW;
+  showEnrollSpinner(0, 255, 180, 0);
 }
 
 void triggerLedEnrollPurple() {
   currentLedState = LED_STATE_ENROLL_PURPLE;
+  showEnrollSpinner(0, 180, 0, 255);
 }
 
 void triggerLedEnrollSuccess() {
-  Serial.println("💡 [LED] Purple Completion Pulse (Enroll Success)");
+  Serial.println("🟣 [LED] Instant Purple Pulse (Enroll Success)");
   currentLedState = LED_STATE_ENROLL_SUCCESS;
   ledStateStartedAt = millis();
+  setAllLeds(180, 0, 255); // INSTANT HARDWARE WRITE (<0.24ms)
 }
 
 void triggerLedOff() {
   currentLedState = LED_STATE_OFF;
+  setAllLeds(0, 0, 0);
 }
 
 void triggerLedIdle() {
@@ -353,7 +364,12 @@ const uint8_t NUM_AURA_THEMES = 4;
 void updateLedSystem() {
   // 1. If door is currently unlocked, hold solid emerald green
   if (isSolenoidUnlocked) {
-    setAllLeds(0, 255, 0);
+    // Solid green was set instantly by triggerLedAccessGranted(). Refresh at 10Hz to prevent bus flooding.
+    static unsigned long lastUnlockedRefresh = 0;
+    if (millis() - lastUnlockedRefresh >= 100) {
+      lastUnlockedRefresh = millis();
+      setAllLeds(0, 255, 0);
+    }
     return;
   }
 
@@ -391,7 +407,7 @@ void updateLedSystem() {
   if (currentLedState == LED_STATE_DENIED_UNKNOWN) {
     unsigned long elapsed = millis() - ledStateStartedAt;
     if (elapsed < 1200) {
-      setAllLeds(255, 100, 0);
+      // Steady amber was already set instantly by triggerLedAccessDeniedUnknown()
       return;
     } else {
       currentLedState = LED_STATE_IDLE;
@@ -923,6 +939,7 @@ void logAccessEvent(String type, String memberId, String reason) {
   if (!https.begin(client, url)) return;
   
   applyAuthHeader(https);
+  https.setTimeout(2500);
 
   // Compute real Unix epoch timestamp (ms) and ISO string via NTP
   time_t now = time(nullptr);
@@ -994,15 +1011,34 @@ void sendRtdbPut(const String &subPath, const String &jsonPayload) {
   }
 }
 
+void sendRtdbHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
+
+  time_t now = time(nullptr);
+  unsigned long long nowEpochMs = 0;
+  if (now > 100000) {
+    nowEpochMs = (unsigned long long)now * 1000ULL;
+  } else {
+    nowEpochMs = (unsigned long long)millis();
+  }
+
+  char timeBuf[32];
+  snprintf(timeBuf, sizeof(timeBuf), "%llu", nowEpochMs);
+
+  String payload = "{\"state\":\"online\",\"wifi_rssi\":" + String(WiFi.RSSI()) + ",\"version\":\"" + String(FIRMWARE_VERSION) + "\",\"last_seen\":" + String(timeBuf) + "}";
+  sendRtdbPut("status", payload);
+  Serial.printf("📡 [RTDB HEARTBEAT] Live presence updated (RSSI: %d dBm, Ver: %s)\n", WiFi.RSSI(), FIRMWARE_VERSION);
+}
+
 void handleRtdbEvent(const String &path, const String &dataJson) {
   // 1. Remote Unlock Command
   if (dataJson.indexOf("\"command\":\"UNLOCK\"") != -1 || dataJson.indexOf("\"action\":\"UNLOCK\"") != -1) {
     String st = extractJsonField(dataJson, "status");
     if (st == "PENDING" || st == "") {
       Serial.println("\n⚡ [RTDB REALTIME] Instant Remote Unlock command received from Web Dashboard!");
-      soundAccessGranted();
       triggerLedAccessGranted();
       triggerSolenoid(3);
+      soundAccessGranted();
       logAccessEvent("REMOTE_UNLOCK", "ADMIN", "Dashboard Remote Open (RTDB)");
       sendRtdbPut("command/status", "\"COMPLETED\"");
     }
@@ -1067,6 +1103,13 @@ void handleRtdbEvent(const String &path, const String &dataJson) {
       checkOtaUpdate();
     }
   }
+
+  // 6. Remote Factory Reset Command
+  if (dataJson.indexOf("\"command\":\"RESET\"") != -1 || dataJson.indexOf("\"command\":\"FACTORY_RESET\"") != -1) {
+    Serial.println("\n🔄 [RTDB REALTIME] Remote Factory Reset Command Received!");
+    sendRtdbPut("command/status", "\"COMPLETED\"");
+    performFactoryReset();
+  }
 }
 
 void processRtdbStream() {
@@ -1119,6 +1162,7 @@ void processRtdbStream() {
         if (streamOk) {
           isRtdbStreamActive = true;
           Serial.println("⚡ [RTDB] Connected & Verified! Push-driven Realtime Stream is ACTIVE (0 Firestore reads).");
+          sendRtdbHeartbeat();
         } else {
           Serial.println("❌ [RTDB] HTTP Handshake failed or not 200 OK. Falling back to periodic check.");
           rtdbStreamClient.stop();
@@ -1172,9 +1216,9 @@ void checkRemoteUnlockCommand() {
     String st  = extractJsonField(resp, "status");
     if (cmd == "UNLOCK" && st == "PENDING") {
       Serial.println("\n⚡ [REMOTE UNLOCK] Command received from Web Dashboard!");
-      soundAccessGranted();
       triggerLedAccessGranted();
       triggerSolenoid(3);
+      soundAccessGranted();
       logAccessEvent("REMOTE_UNLOCK", "ADMIN", "Dashboard Remote Open");
 
       // Mark command COMPLETED
@@ -1225,6 +1269,7 @@ void checkEnrollmentRequest() {
   if (!https.begin(client, url)) return;
   
   applyAuthHeader(https);
+  https.setTimeout(2500);
   int httpCode = https.GET();
   if (httpCode == 200) {
     String resp = https.getString();
@@ -1253,6 +1298,7 @@ void updateEnrollmentStatus(String status, uint8_t fingerId) {
   if (!https.begin(client, url)) return;
   
   applyAuthHeader(https);
+  https.setTimeout(2500);
   String payload = "{\"fields\":{"
     "\"status\":{\"stringValue\":\"" + status + "\"},"
     "\"fingerprint_id\":{\"stringValue\":\"" + String(fingerId) + "\"}"
@@ -1408,8 +1454,8 @@ void runEnrollmentProcess() {
 
   if (nextSlot == 0 || nextSlot > MAX_SENSOR_CAPACITY) {
     Serial.println("❌ [ENROLL] Sensor storage is full! No free slots available.");
-    soundEnrollFailed();
     triggerLedAccessDeniedExpired();
+    soundEnrollFailed();
     updateEnrollmentStatus("SENSOR_FULL", 0);
     return;
   }
@@ -1426,24 +1472,24 @@ void runEnrollmentProcess() {
     delay(20);
   }
   if (p != FINGERPRINT_OK || finger.image2Tz(1) != FINGERPRINT_OK) {
-    soundEnrollFailed();
     triggerLedAccessDeniedExpired();
+    soundEnrollFailed();
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
 
   // Touch 1 captured: Purple rotating animation
   Serial.println("👉 [ENROLL] Touch 1 Scanned! Remove finger...");
-  soundEnrollStep1();
   triggerLedEnrollPurple();
+  soundEnrollStep1();
   delay(800);
 
   // Check if finger is ALREADY enrolled on this sensor to prevent duplicate slots
   if (finger.fingerFastSearch() == FINGERPRINT_OK) {
     uint8_t existingSlot = finger.fingerID;
     Serial.printf("⚠️ [ALREADY ENROLLED] Finger already registered in Slot #%d! Re-linking.\n", existingSlot);
-    soundEnrollSuccess();
     triggerLedEnrollSuccess();
+    soundEnrollSuccess();
     saveMemberToLocalCache(existingSlot, true, "2099-12-31", "Member");
     updateEnrollmentStatus("SUCCESS", existingSlot);
     return;
@@ -1466,29 +1512,29 @@ void runEnrollmentProcess() {
     delay(50);
   }
   if (p != FINGERPRINT_OK || finger.image2Tz(2) != FINGERPRINT_OK) {
-    soundEnrollFailed();
     triggerLedAccessDeniedExpired();
+    soundEnrollFailed();
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
 
   if (finger.createModel() != FINGERPRINT_OK) {
-    soundEnrollFailed();
     triggerLedAccessDeniedExpired();
+    soundEnrollFailed();
     updateEnrollmentStatus("ERROR", 0);
     return;
   }
 
   if (finger.storeModel(nextSlot) == FINGERPRINT_OK) {
     Serial.printf("🎉 Enrolled into Slot #%d!\n", nextSlot);
+    triggerLedEnrollSuccess(); // Purple completion pulse immediately
     soundEnrollSuccess();
-    triggerLedEnrollSuccess(); // Purple completion pulse
     // Pre-cache immediately so member can scan right away!
     saveMemberToLocalCache(nextSlot, true, "2099-12-31", "New Member");
     updateEnrollmentStatus("SUCCESS", nextSlot);
   } else {
-    soundEnrollFailed();
     triggerLedAccessDeniedExpired();
+    soundEnrollFailed();
     updateEnrollmentStatus("ERROR", 0);
   }
 }
@@ -1502,26 +1548,26 @@ void handleFingerprintVerification() {
   if (millis() < fingerCooldownUntil) return;
 
   Serial.println("\n👆 Finger detected. Reading...");
-  delay(60);
+  delay(15);
   
   uint8_t p = FINGERPRINT_NOFINGER;
   for (int tries = 0; tries < 4; tries++) {
     p = finger.getImage();
     if (p == FINGERPRINT_OK) break;
-    delay(80);
+    delay(30);
   }
 
   if (p != FINGERPRINT_OK || finger.image2Tz() != FINGERPRINT_OK) {
-    soundAccessDeniedUnknown();
-    triggerLedAccessDeniedUnknown(); // Steady amber LED + buzzer beep
+    triggerLedAccessDeniedUnknown(); // Instant Amber LED
+    soundAccessDeniedUnknown();      // Crisp double beep
     fingerCooldownUntil = millis() + 1500;
     return;
   }
 
   if (finger.fingerFastSearch() != FINGERPRINT_OK) {
     Serial.println("❌ Access Denied: Unknown Fingerprint.");
-    soundAccessDeniedUnknown();
-    triggerLedAccessDeniedUnknown(); // Steady amber LED + buzzer beep
+    triggerLedAccessDeniedUnknown(); // Instant Amber LED
+    soundAccessDeniedUnknown();      // Crisp double beep
     logAccessEvent("DENIED", "UNKNOWN", "Not recognized");
     fingerCooldownUntil = millis() + 1500;
     return;
@@ -1543,8 +1589,8 @@ void handleFingerprintVerification() {
     // 2. Access Denied: Inactive membership
     if (!active) {
       Serial.printf("🔴 ACCESS DENIED: Membership Inactive for %s\n", memberName.c_str());
+      triggerLedAccessDeniedExpired();   // Rapid red pulse instantly
       soundAccessDeniedExpired();        // 3 rapid short beeps
-      triggerLedAccessDeniedExpired();   // Rapid red pulse
       logAccessEvent("DENIED", String(slotId), "Membership inactive");
       fingerCooldownUntil = millis() + 1500;
       return;
@@ -1553,8 +1599,8 @@ void handleFingerprintVerification() {
     // 2. Access Denied: Expired membership
     if (expiry.length() == 10 && todayDate.length() == 10 && expiry < todayDate) {
       Serial.printf("🔴 ACCESS DENIED: Membership Expired for %s\n", memberName.c_str());
+      triggerLedAccessDeniedExpired();   // Rapid red pulse instantly
       soundAccessDeniedExpired();        // 3 rapid short beeps
-      triggerLedAccessDeniedExpired();   // Rapid red pulse
       logAccessEvent("DENIED", String(slotId), "Membership expired");
       fingerCooldownUntil = millis() + 1500;
       return;
@@ -1562,9 +1608,9 @@ void handleFingerprintVerification() {
 
     // 1. ACCESS GRANTED: Valid fingerprint + Active membership!
     Serial.printf("🟢 ACCESS GRANTED (INSTANT LOCAL)! Welcome, %s!\n", memberName.c_str());
-    soundAccessGranted();              // One short beep (~160ms)
-    triggerLedAccessGranted();         // Blinks solid green (triple pulse) & holds green
-    triggerSolenoid(3);                // Solenoid activates for 3 seconds
+    triggerLedAccessGranted();         // Turns solid emerald green IMMEDIATELY (<0.24ms)
+    triggerSolenoid(3);                // Solenoid activates IMMEDIATELY
+    soundAccessGranted();              // Buzzer beep sounds in sync (~160ms)
     logAccessEvent("GRANTED", String(slotId), "Active membership (Local)");
     fingerCooldownUntil = millis() + 3000;
     return;
@@ -1580,6 +1626,7 @@ void handleFingerprintVerification() {
     String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + ":runQuery";
     if (https.begin(client, url)) {
       applyAuthHeader(https);
+      https.setTimeout(2500);
       String queryPayload = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"members\"}],\"where\":{\"fieldFilter\":{\"field\":{\"fieldPath\":\"fingerprint_id\"},\"op\":\"EQUAL\",\"value\":{\"stringValue\":\"" + String(slotId) + "\"}}},\"limit\":1}}";
 
       int httpCode = https.POST(queryPayload);
@@ -1591,6 +1638,7 @@ void handleFingerprintVerification() {
           https.end();
           if (https.begin(client, url)) {
             applyAuthHeader(https);
+            https.setTimeout(2500);
             String intQuery = "{\"structuredQuery\":{\"from\":[{\"collectionId\":\"members\"}],\"where\":{\"fieldFilter\":{\"field\":{\"fieldPath\":\"fingerprint_id\"},\"op\":\"EQUAL\",\"value\":{\"integerValue\":\"" + String(slotId) + "\"}}},\"limit\":1}}";
             int intCode = https.POST(intQuery);
             if (intCode == 200) {
@@ -1607,17 +1655,17 @@ void handleFingerprintVerification() {
           if (status == "active" && (expiry.length() < 10 || todayDate.length() < 10 || expiry >= todayDate)) {
             Serial.printf("🟢 ACCESS GRANTED (CLOUD)! Welcome, %s!\n", name.c_str());
             saveMemberToLocalCache(slotId, true, expiry, name);
-            soundAccessGranted();            // One short beep (~160ms)
-            triggerLedAccessGranted();       // Blinks solid green (triple pulse) & holds green
-            triggerSolenoid(3);              // Solenoid activates for 3 seconds
+            triggerLedAccessGranted();       // Turns solid emerald green IMMEDIATELY (<0.24ms)
+            triggerSolenoid(3);              // Solenoid activates IMMEDIATELY
+            soundAccessGranted();            // Buzzer beep sounds in sync (~160ms)
             logAccessEvent("GRANTED", String(slotId), "Active membership (Cloud)");
             https.end();
             return;
           } else {
             Serial.println("🔴 ACCESS DENIED: Expired or inactive in cloud.");
             saveMemberToLocalCache(slotId, false, expiry, name);
+            triggerLedAccessDeniedExpired(); // Rapid red pulse instantly
             soundAccessDeniedExpired();      // 3 rapid short beeps
-            triggerLedAccessDeniedExpired(); // Rapid red pulse
             logAccessEvent("DENIED", String(slotId), "Expired/Inactive");
             delay(400);
             https.end();
@@ -1640,8 +1688,8 @@ void handleFingerprintVerification() {
 
   // FAIL CLOSED (3. Unknown / unverified)
   Serial.println("⚠️ Access Denied: Unverified record.");
+  triggerLedAccessDeniedUnknown(); // Instant Amber LED
   soundAccessDeniedUnknown();
-  triggerLedAccessDeniedUnknown();
   logAccessEvent("DENIED", String(slotId), "Unverified");
   fingerCooldownUntil = millis() + 1500;
 }
@@ -1722,6 +1770,50 @@ void handleSaveConfig() {
   }
 }
 
+// ==========================================
+// 10b. FACTORY RESET ENGINE
+// ==========================================
+void performFactoryReset() {
+  Serial.println("\n⚠️ ========================================");
+  Serial.println("⚠️ [FACTORY RESET] Erasing all credentials and data...");
+  Serial.println("⚠️ ========================================");
+
+  // Audio & Visual Warning Alert
+  for (int i = 0; i < 3; i++) {
+    setAllLeds(255, 0, 0); // Solid Red
+    activeBeep(60, 40);
+    setAllLeds(0, 0, 0);
+    delay(40);
+  }
+
+  // 1. Wipe Wi-Fi & Linking Key from NVS
+  prefs.begin("fitness_box", false);
+  prefs.clear();
+  prefs.end();
+  Serial.println("🗑️ [RESET] Wi-Fi SSID, Password & Linking Key erased from NVS.");
+
+  // 2. Wipe Local Member Cache
+  prefs.begin("fb_cache", false);
+  prefs.clear();
+  prefs.end();
+  for (int i = 0; i <= MAX_SENSOR_CAPACITY; i++) localCache[i].valid = false;
+  Serial.println("🗑️ [RESET] Local offline member cache erased.");
+
+  // 3. Wipe Fingerprint Sensor Hardware Templates
+  finger.emptyDatabase();
+  Serial.println("🗑️ [RESET] Fingerprint sensor templates wiped.");
+
+  // 4. Confirmation melody & Blue LED (Setup AP Color)
+  setAllLeds(0, 80, 255);
+  activeBeep(50, 40);
+  activeBeep(90, 50);
+  activeBeep(200, 0);
+  Serial.println("🔄 [RESET] Reset complete! Rebooting into Setup Portal...\n");
+  delay(1000);
+
+  ESP.restart();
+}
+
 void startCaptivePortal() {
   isSetupMode = true;
   setupModeStartedAt = millis();
@@ -1777,6 +1869,19 @@ void setup() {
 
   // --- 8-LED Hardware Diagnostic & Showcase Sequence ---
   runLedStartupTest();
+
+  // Power-on Factory Reset Check: Hold exit button for 3 seconds while powering on
+  if (digitalRead(EXIT_BUTTON_PIN) == LOW) {
+    Serial.println("🔘 [BOOT] Exit button held at power-on. Checking for Factory Reset...");
+    unsigned long bootCheck = millis();
+    while (digitalRead(EXIT_BUTTON_PIN) == LOW && (millis() - bootCheck < 3000)) {
+      activeBeep(30, 70);
+    }
+    if (millis() - bootCheck >= 3000) {
+      Serial.println("🔘 [BOOT] 3-second hold confirmed! Triggering Factory Reset...");
+      performFactoryReset();
+    }
+  }
 
 
 
@@ -1880,15 +1985,32 @@ void loop() {
   // Non-blocking solenoid relay timer
   updateSolenoidState();
 
-  // 1. Interior Push-to-Exit Button (Debounced)
+  // 1. Interior Push-to-Exit Button (Debounced + 7-second Long-Press Factory Reset)
   static bool lastExitButton = HIGH;
+  static unsigned long exitButtonPressStart = 0;
+  static bool exitButtonActionTriggered = false;
   bool currentExitButton = digitalRead(EXIT_BUTTON_PIN);
+
   if (lastExitButton == HIGH && currentExitButton == LOW) {
-    delay(20);
-    if (digitalRead(EXIT_BUTTON_PIN) == LOW) {
+    // Just pressed
+    exitButtonPressStart = millis();
+    exitButtonActionTriggered = false;
+  } else if (currentExitButton == LOW) {
+    // Currently being held down
+    unsigned long holdDuration = millis() - exitButtonPressStart;
+    if (holdDuration > 7000 && !exitButtonActionTriggered) {
+      exitButtonActionTriggered = true;
+      Serial.println("\n🔘 [HARDWARE BUTTON] 7-second long-press detected! Triggering Factory Reset...");
+      performFactoryReset();
+    }
+  } else if (lastExitButton == LOW && currentExitButton == HIGH) {
+    // Just released
+    unsigned long holdDuration = millis() - exitButtonPressStart;
+    if (holdDuration >= 50 && holdDuration < 4000 && !exitButtonActionTriggered) {
       Serial.println("🚪 [EXIT] Interior Exit Button Pressed!");
-      soundExitButton();
+      triggerLedAccessGranted();
       triggerSolenoid(3);
+      soundExitButton();
       logAccessEvent("EXIT", "INTERIOR_BUTTON", "Free exit");
     }
   }
@@ -1901,6 +2023,13 @@ void loop() {
 
   // 3. Firebase Realtime Database SSE Stream (Zero-read Push Events)
   processRtdbStream();
+
+  // 3b. Live Presence Heartbeat to RTDB (Every 25 seconds for live status without page reload)
+  static unsigned long lastHeartbeat = 0;
+  if (isRtdbStreamActive && (millis() - lastHeartbeat > 25000)) {
+    lastHeartbeat = millis();
+    sendRtdbHeartbeat();
+  }
 
   // If RTDB stream is active, periodic polling is DISABLED (0 Firestore reads!).
   // If RTDB stream is disconnected/reconnecting, fallback polling runs safely every 4s.
@@ -1927,7 +2056,9 @@ void loop() {
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
-    if (cmd == "CLEAR_SENSOR") {
+    if (cmd == "RESET" || cmd == "FACTORY_RESET") {
+      performFactoryReset();
+    } else if (cmd == "CLEAR_SENSOR") {
       finger.emptyDatabase();
       prefs.begin("fb_cache", false);
       prefs.clear();
