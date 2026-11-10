@@ -1330,9 +1330,16 @@ void checkEnrollmentRequest() {
   https.end();
 }
 
-void updateEnrollmentStatus(String status, uint8_t fingerId) {
+void updateEnrollmentStatus(String status, uint8_t fingerId, String message = "") {
+  if (status == "DUPLICATE" && message == "") {
+    message = "Fingerprint already enrolled";
+  }
   // Push status immediately to Firebase Realtime Database
-  String rtdbPayload = "{\"command\":\"IDLE\",\"status\":\"" + status + "\",\"fingerprint_id\":\"" + String(fingerId) + "\",\"timestamp\":" + String(millis()) + "}";
+  String rtdbPayload = "{\"command\":\"IDLE\",\"status\":\"" + status + "\",\"fingerprint_id\":\"" + String(fingerId) + "\"";
+  if (message != "") {
+    rtdbPayload += ",\"message\":\"" + message + "\"";
+  }
+  rtdbPayload += ",\"timestamp\":" + String(millis()) + "}";
   sendRtdbPut("enrollment", rtdbPayload);
 
   if (WiFi.status() != WL_CONNECTED || linkedGymId == "") return;
@@ -1342,14 +1349,20 @@ void updateEnrollmentStatus(String status, uint8_t fingerId) {
   HTTPClient https;
   
   String url = "https://firestore.googleapis.com/v1/projects/" + String(FIREBASE_PROJECT_ID) + "/databases/(default)/documents/gyms/" + linkedGymId + "/scanners/enrollment?updateMask.fieldPaths=status&updateMask.fieldPaths=fingerprint_id";
+  if (message != "") {
+    url += "&updateMask.fieldPaths=message";
+  }
   if (!https.begin(client, url)) return;
   
   applyAuthHeader(https);
   https.setTimeout(2500);
   String payload = "{\"fields\":{"
     "\"status\":{\"stringValue\":\"" + status + "\"},"
-    "\"fingerprint_id\":{\"stringValue\":\"" + String(fingerId) + "\"}"
-  "}}";
+    "\"fingerprint_id\":{\"stringValue\":\"" + String(fingerId) + "\"}";
+  if (message != "") {
+    payload += ",\"message\":{\"stringValue\":\"" + message + "\"}";
+  }
+  payload += "}}";
   
   https.PATCH(payload);
   https.end();
@@ -1534,11 +1547,10 @@ void runEnrollmentProcess() {
   // Check if finger is ALREADY enrolled on this sensor to prevent duplicate slots
   if (finger.fingerFastSearch() == FINGERPRINT_OK) {
     uint8_t existingSlot = finger.fingerID;
-    Serial.printf("⚠️ [ALREADY ENROLLED] Finger already registered in Slot #%d! Re-linking.\n", existingSlot);
-    triggerLedEnrollSuccess();
-    soundEnrollSuccess();
-    saveMemberToLocalCache(existingSlot, true, "2099-12-31", "Member");
-    updateEnrollmentStatus("SUCCESS", existingSlot);
+    Serial.printf("⚠️ [DUPLICATE] Finger already registered in Slot #%d! Rejecting duplicate enrollment.\n", existingSlot);
+    triggerLedAccessDeniedExpired();
+    soundEnrollFailed();
+    updateEnrollmentStatus("DUPLICATE", existingSlot);
     return;
   }
   
